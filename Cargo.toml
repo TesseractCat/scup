@@ -1,0 +1,11 @@
+[package]
+name = "syncup"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = "4.6.0"
+ignore = "0.4.25"
+kdam = "0.6.4"
+serde = { version = "1.0.228", features = ["derive"] }
+sha2 = "0.11.0"
