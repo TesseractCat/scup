@@ -1,6 +1,6 @@
 // https://joshleeb.com/posts/gear-hashing.html
 
-pub const SPLIT_BITS: usize = 20;
+pub const SPLIT_BITS: usize = 16; // ~65 KB
 pub const SPLIT_MASK: u64 = const {
     // FastCDC technique: Evenly distribute mask bits
     let divisions = 64 / SPLIT_BITS;
@@ -11,6 +11,34 @@ pub const SPLIT_MASK: u64 = const {
         i += 1;
     }
     mask
+};
+pub const FAN_COUNT: usize = 8;
+pub const FAN_BITS: usize = 4; // ~1 OOM
+pub const FAN_MASKS: [u64; FAN_COUNT] = const {
+    let mut masks = [0u64; FAN_COUNT];
+    let mut j = 0;
+    while j < FAN_COUNT {
+        // FastCDC technique: Evenly distribute mask bits
+        let divisions = 64 / FAN_BITS;
+        let mut target: u64 = 1;
+        let mut mask = 0;
+        let mut i = 0;
+        while i < FAN_BITS {
+            loop {
+                if SPLIT_MASK & target > 0 {
+                    target = target << 1;
+                } else {
+                    break;
+                }
+            }
+            mask = mask | target;
+            target = target << divisions;
+            i += 1;
+        }
+        masks[j] = mask;
+        j += 1;
+    }
+    masks
 };
 pub const AVERAGE_CHUNK_SIZE: usize = 2 << (SPLIT_BITS - 1);
 pub const MAX_CHUNK_SIZE: usize = 8 * AVERAGE_CHUNK_SIZE; // ~8 MB hard cap

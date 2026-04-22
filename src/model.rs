@@ -36,7 +36,7 @@ pub struct Chunk;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Blob {
-    pub chunks: Vec<ObjectId>,
+    pub chunks: ObjectId,
     pub modified_time: Option<SystemTime>,
     pub accessed_time: Option<SystemTime>,
     pub created_time: Option<SystemTime>,
@@ -57,8 +57,13 @@ impl Debug for Blob {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Tree {
-    pub files: BTreeMap<String, ObjectId>,
+pub struct List {
+    pub entries: Vec<ObjectId>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Map {
+    pub entries: BTreeMap<String, ObjectId>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -72,8 +77,10 @@ pub struct Snapshot {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Object {
+    Chunk(Chunk),
     Blob(Blob),
-    Tree(Tree),
+    Map(Map),
+    List(List),
     Snapshot(Snapshot),
 }
 
@@ -81,7 +88,6 @@ pub enum Object {
 pub struct Repository {
     #[serde(default)]
     pub repo_uuid: [u8; 32],
-    pub chunks: BTreeMap<ObjectId, Chunk>,
     pub objects: BTreeMap<ObjectId, Object>,
     pub head: ObjectId,
 }

@@ -18,7 +18,7 @@ mod cli;
 use cli::cli;
 
 mod model;
-pub use model::{Blob, Chunk, Object, ObjectId, Repository, Snapshot, Tree, to_hex};
+pub use model::{Blob, Chunk, Object, ObjectId, Repository, Snapshot, Map, to_hex};
 
 mod scan;
 mod protocol;
@@ -154,7 +154,7 @@ impl Repository {
         let Some(Object::Tree(tree)) = self.objects.get(&snap.tree) else {
             return BTreeMap::new();
         };
-        tree.files.clone()
+        tree.entries.clone()
     }
 
     fn blob_modified_time(&self, blob_id: ObjectId) -> Option<SystemTime> {
@@ -229,7 +229,7 @@ impl Repository {
 
         let merged_tree_id = tree_object_id(&merged_files);
         self.objects
-            .insert(merged_tree_id, Object::Tree(Tree { files: merged_files }));
+            .insert(merged_tree_id, Object::Tree(Map { entries: merged_files }));
 
         let mut parents = vec![local_head, remote_head];
         parents.sort();
@@ -273,7 +273,7 @@ impl Repository {
             if let Some(Object::Snapshot(snap)) = self.objects.get(&self.head) {
                 let tree_id = snap.tree;
                 if let Some(Object::Tree(tree)) = self.objects.get(&tree_id) {
-                    tree.files
+                    tree.entries
                         .iter()
                         .map(|(path, &blob_id)| {
                             let mtime = match self.objects.get(&blob_id) {
@@ -355,7 +355,7 @@ impl Repository {
 
         let tid = tree_object_id(&tree_files);
         self.objects
-            .insert(tid, Object::Tree(Tree { files: tree_files }));
+            .insert(tid, Object::Tree(Map { entries: tree_files }));
 
         let snap = Snapshot {
             parents: if self.head.0.iter().all(|x| *x == 0) { vec![] } else { vec![self.head]},
