@@ -3,7 +3,7 @@
 pub const SPLIT_BITS: usize = 20;
 pub const SPLIT_MASK: u64 = const {
     // FastCDC technique: Evenly distribute mask bits
-    let divisions = 64/SPLIT_BITS;
+    let divisions = 64 / SPLIT_BITS;
     let mut mask = 0;
     let mut i = 0;
     while i < SPLIT_BITS {
@@ -280,9 +280,7 @@ pub struct Rollsum {
 
 impl Rollsum {
     pub fn new() -> Self {
-        Self {
-            fp: 0,
-        }
+        Self { fp: 0 }
     }
 
     pub fn roll(&mut self, ch: u8) {

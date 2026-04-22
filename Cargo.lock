@@ -1786,6 +1786,7 @@ dependencies = [
  "kdam",
  "mdns-sd",
  "postcard",
+ "rand",
  "russh",
  "russh-keys",
  "serde",

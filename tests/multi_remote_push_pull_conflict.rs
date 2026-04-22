@@ -1,0 +1,318 @@
+#[path = "../src/model.rs"]
+mod model;
+
+use model::{Blob, Object, Repository, Tree, to_hex};
+use std::fs;
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+fn bin() -> &'static str {
+    env!("CARGO_BIN_EXE_syncup")
+}
+
+fn unique_temp_dir(prefix: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+    fs::create_dir_all(&dir).expect("failed to create temporary directory");
+    dir
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).expect("failed to create destination directory");
+    for entry in fs::read_dir(src).expect("failed to read source directory") {
+        let entry = entry.expect("failed to read directory entry");
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let ft = entry.file_type().expect("failed to read file type");
+        if ft.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path);
+        } else if ft.is_file() {
+            fs::copy(&src_path, &dst_path).unwrap_or_else(|e| {
+                panic!("failed to copy {} -> {}: {e}", src_path.display(), dst_path.display())
+            });
+        }
+    }
+}
+
+fn free_port() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind to ephemeral port");
+    let port = listener.local_addr().expect("failed to read local addr").port();
+    drop(listener);
+    port
+}
+
+fn run_ok(mut cmd: Command, what: &str) -> std::process::Output {
+    let output = cmd.output().unwrap_or_else(|e| panic!("failed to run {what}: {e}"));
+    assert!(
+        output.status.success(),
+        "{what} failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn wait_for_tcp(addr: (&str, u16), timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if TcpStream::connect(addr).is_ok() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("server did not listen on {}:{} in time", addr.0, addr.1);
+}
+
+fn wait_for_scan_hosts(local_dir: &Path, expected_fullnames: &[String], timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let out = run_ok(
+            {
+                let mut cmd = Command::new(bin());
+                cmd.current_dir(local_dir).arg("scan").arg("--timeout").arg("2");
+                cmd
+            },
+            "syncup scan",
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let ok = expected_fullnames
+            .iter()
+            .all(|name| stdout.lines().any(|line| line.contains(name)));
+        if ok {
+            return;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    panic!("did not discover all expected hosts in time");
+}
+
+struct ChildGuard(Child);
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+
+fn read_repo(dir: &Path) -> Repository {
+    let bytes = fs::read(dir.join(".syncup/repository")).expect("failed to read repository file");
+    postcard::from_bytes(&bytes).expect("failed to deserialize repository")
+}
+
+fn head_tree(repo: &Repository) -> &Tree {
+    let snap = match repo.objects.get(&repo.head) {
+        Some(Object::Snapshot(s)) => s,
+        _ => panic!("head is not a snapshot"),
+    };
+    match repo.objects.get(&snap.tree) {
+        Some(Object::Tree(t)) => t,
+        _ => panic!("snapshot tree missing"),
+    }
+}
+
+fn blob_for_file<'a>(repo: &'a Repository, filename: &str) -> &'a Blob {
+    let tree = head_tree(repo);
+    let (_, blob_id) = tree
+        .files
+        .iter()
+        .find(|(path, _)| path.as_str() == filename || path.ends_with(&format!("/{filename}")) || path.as_str() == format!("./{filename}"))
+        .unwrap_or_else(|| panic!("file not found in head tree: {filename}"));
+
+    match repo.objects.get(blob_id) {
+        Some(Object::Blob(b)) => b,
+        _ => panic!("blob object missing for file: {filename}"),
+    }
+}
+
+fn file_content_from_repo(dir: &Path, repo: &Repository, filename: &str) -> Vec<u8> {
+    let blob = blob_for_file(repo, filename);
+    let mut out = Vec::new();
+    for id in &blob.chunks {
+        let path = dir.join(format!(".syncup/chunks/{}", to_hex(&id.0)));
+        let bytes = fs::read(path).expect("failed to read chunk");
+        out.extend_from_slice(&bytes);
+    }
+    out
+}
+
+#[test]
+fn push_pull_multiple_remotes_then_conflict() {
+    let root = unique_temp_dir("syncup-multi-remote");
+    let seed = root.join("seed");
+    let local = root.join("local");
+    let remote1 = root.join("remote1");
+    let remote2 = root.join("remote2");
+
+    fs::create_dir_all(&seed).expect("failed to create seed dir");
+    fs::write(seed.join("base.txt"), b"base\n").expect("failed to write base file");
+
+    run_ok(
+        {
+            let mut cmd = Command::new(bin());
+            cmd.current_dir(&seed).arg("init");
+            cmd
+        },
+        "syncup init (seed)",
+    );
+
+    copy_dir_recursive(&seed, &local);
+    copy_dir_recursive(&seed, &remote1);
+    copy_dir_recursive(&seed, &remote2);
+
+    let port1 = free_port();
+    let port2 = free_port();
+    let host1 = format!("syncup-test-r1-{}", std::process::id());
+    let host2 = format!("syncup-test-r2-{}", std::process::id());
+    let full1 = format!("syncup-{host1}._syncup._tcp.local.");
+    let full2 = format!("syncup-{host2}._syncup._tcp.local.");
+
+    let server1 = ChildGuard(
+        Command::new(bin())
+            .current_dir(&remote1)
+            .env("HOSTNAME", &host1)
+            .arg("serve")
+            .arg("--port")
+            .arg(port1.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to start server1"),
+    );
+
+    let server2 = ChildGuard(
+        Command::new(bin())
+            .current_dir(&remote2)
+            .env("HOSTNAME", &host2)
+            .arg("serve")
+            .arg("--port")
+            .arg(port2.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to start server2"),
+    );
+
+    wait_for_tcp(("127.0.0.1", port1), Duration::from_secs(10));
+    wait_for_tcp(("127.0.0.1", port2), Duration::from_secs(10));
+    wait_for_scan_hosts(&local, &[full1.clone(), full2.clone()], Duration::from_secs(20));
+
+    // 1) Standard push to multiple remotes.
+    fs::write(local.join("from_local.txt"), b"hello from local\n").expect("failed to write local file");
+    run_ok(
+        {
+            let mut cmd = Command::new(bin());
+            cmd.current_dir(&local)
+                .arg("snapshot")
+                .arg("-m")
+                .arg("local change before push");
+            cmd
+        },
+        "local snapshot before push",
+    );
+
+    run_ok(
+        {
+            let mut cmd = Command::new(bin());
+            cmd.current_dir(&local).arg("push");
+            cmd
+        },
+        "local push",
+    );
+
+    let r1_repo = read_repo(&remote1);
+    let r2_repo = read_repo(&remote2);
+    let r1_tree = head_tree(&r1_repo);
+    let r2_tree = head_tree(&r2_repo);
+    assert!(r1_tree.files.keys().any(|p| p.ends_with("from_local.txt") || p == "from_local.txt" || p == "./from_local.txt"));
+    assert!(r2_tree.files.keys().any(|p| p.ends_with("from_local.txt") || p == "from_local.txt" || p == "./from_local.txt"));
+
+    // 2) Standard pull from one remote (still through multi-remote pull command).
+    fs::write(remote1.join("from_remote1.txt"), b"hello from remote1\n")
+        .expect("failed to write remote1 file");
+    run_ok(
+        {
+            let mut cmd = Command::new(bin());
+            cmd.current_dir(&remote1)
+                .arg("snapshot")
+                .arg("-m")
+                .arg("remote1 change before pull");
+            cmd
+        },
+        "remote1 snapshot",
+    );
+
+    run_ok(
+        {
+            let mut cmd = Command::new(bin());
+            cmd.current_dir(&local).arg("pull");
+            cmd
+        },
+        "local pull",
+    );
+
+    let local_repo_after_pull = read_repo(&local);
+    let local_tree_after_pull = head_tree(&local_repo_after_pull);
+    assert!(
+        local_tree_after_pull
+            .files
+            .keys()
+            .any(|p| p.ends_with("from_remote1.txt") || p == "from_remote1.txt" || p == "./from_remote1.txt"),
+        "local repo missing file from remote1 after pull"
+    );
+
+    // 3) Conflict: remote1 older, remote2 newer; pull should keep newer mtime content.
+    fs::write(remote1.join("conflict.txt"), b"older\n").expect("failed to write conflict on remote1");
+    run_ok(
+        {
+            let mut cmd = Command::new(bin());
+            cmd.current_dir(&remote1)
+                .arg("snapshot")
+                .arg("-m")
+                .arg("remote1 older conflict");
+            cmd
+        },
+        "remote1 conflict snapshot",
+    );
+
+    thread::sleep(Duration::from_millis(1200));
+
+    fs::write(remote2.join("conflict.txt"), b"newer\n").expect("failed to write conflict on remote2");
+    run_ok(
+        {
+            let mut cmd = Command::new(bin());
+            cmd.current_dir(&remote2)
+                .arg("snapshot")
+                .arg("-m")
+                .arg("remote2 newer conflict");
+            cmd
+        },
+        "remote2 conflict snapshot",
+    );
+
+    run_ok(
+        {
+            let mut cmd = Command::new(bin());
+            cmd.current_dir(&local).arg("pull");
+            cmd
+        },
+        "local pull after conflict",
+    );
+
+    let local_repo_final = read_repo(&local);
+    let conflict_content = file_content_from_repo(&local, &local_repo_final, "conflict.txt");
+    assert_eq!(conflict_content, b"newer\n");
+
+    drop(server1);
+    drop(server2);
+
+    let _ = fs::remove_dir_all(root);
+}

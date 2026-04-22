@@ -1,13 +1,14 @@
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use async_trait::async_trait;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
-use russh::server::{Auth, Handler, Server, Session};
 use russh::ChannelId;
+use russh::server::{Auth, Handler, Server, Session};
 use russh_keys::key::KeyPair;
 use std::{path::PathBuf, sync::Arc};
 
 use crate::protocol::{Request, Response};
-use crate::{to_hex, ObjectId, Repository};
+use crate::{ObjectId, Repository, to_hex};
 
 // ── Server / handler boilerplate ─────────────────────────────────────────────
 
@@ -16,13 +17,20 @@ struct SyncupServer;
 impl Server for SyncupServer {
     type Handler = ConnectionHandler;
     fn new_client(&mut self, _addr: Option<std::net::SocketAddr>) -> Self::Handler {
-        ConnectionHandler { push_buf: None }
+        ConnectionHandler {
+            pending_request: None,
+        }
     }
 }
 
-/// Per-connection state.  `push_buf` is `Some` while we are accumulating push data.
+enum PendingRequest {
+    Pull(Vec<u8>),
+    Push(Vec<u8>),
+}
+
+/// Per-connection state. `pending_request` is `Some` while accumulating request payload bytes.
 struct ConnectionHandler {
-    push_buf: Option<Vec<u8>>,
+    pending_request: Option<PendingRequest>,
 }
 
 #[async_trait]
@@ -49,7 +57,7 @@ impl Handler for ConnectionHandler {
     }
 
     /// Dispatches `status`, `pull`, and `push` SSH exec commands.
-    /// Status and pull reply immediately; push waits for `channel_eof`.
+    /// Status replies immediately; pull/push wait for `channel_eof` so we can parse request payload.
     async fn exec_request(
         &mut self,
         channel: ChannelId,
@@ -58,10 +66,14 @@ impl Handler for ConnectionHandler {
     ) -> Result<()> {
         match std::str::from_utf8(data)? {
             "status" => send_response(channel, session, &handle_status()?)?,
-            "pull"   => send_response(channel, session, &handle_pull()?)?,
-            "push"   => self.push_buf = Some(Vec::new()),
+            "pull" => self.pending_request = Some(PendingRequest::Pull(Vec::new())),
+            "push" => self.pending_request = Some(PendingRequest::Push(Vec::new())),
             cmd => {
-                send_response(channel, session, &Response::Error(format!("unknown command: {cmd}")))?;
+                send_response(
+                    channel,
+                    session,
+                    &Response::Error(format!("unknown command: {cmd}")),
+                )?;
             }
         }
         Ok(())
@@ -74,18 +86,30 @@ impl Handler for ConnectionHandler {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<()> {
-        if let Some(buf) = &mut self.push_buf {
-            buf.extend_from_slice(data);
+        if let Some(pending) = &mut self.pending_request {
+            match pending {
+                PendingRequest::Pull(buf) | PendingRequest::Push(buf) => buf.extend_from_slice(data),
+            }
         }
         Ok(())
     }
 
-    /// Client closed its write side — process any buffered push payload.
+    /// Client closed its write side — process any buffered request payload.
     async fn channel_eof(&mut self, channel: ChannelId, session: &mut Session) -> Result<()> {
-        if let Some(buf) = self.push_buf.take() {
-            let response = match postcard::from_bytes::<Request>(&buf)? {
-                Request::Push { repository, chunks } => handle_push(repository, chunks)?,
-                _ => Response::Error("expected push request".into()),
+        if let Some(pending) = self.pending_request.take() {
+            let response = match pending {
+                PendingRequest::Pull(buf) => match postcard::from_bytes::<Request>(&buf)? {
+                    Request::Pull { repo_uuid } => handle_pull(repo_uuid)?,
+                    _ => Response::Error("expected pull request".into()),
+                },
+                PendingRequest::Push(buf) => match postcard::from_bytes::<Request>(&buf)? {
+                    Request::Push {
+                        repo_uuid,
+                        repository,
+                        chunks,
+                    } => handle_push(repo_uuid, repository, chunks)?,
+                    _ => Response::Error("expected push request".into()),
+                },
             };
             send_response(channel, session, &response)?;
         }
@@ -111,29 +135,66 @@ fn load_repository() -> Result<Repository> {
 // ── Request handlers ──────────────────────────────────────────────────────────
 
 fn handle_status() -> Result<Response> {
-    Ok(Response::Status { head: load_repository()?.head })
+    Ok(Response::Status {
+        head: load_repository()?.head,
+    })
 }
 
-fn handle_pull() -> Result<Response> {
+fn handle_pull(repo_uuid: [u8; 32]) -> Result<Response> {
     let repo = load_repository()?;
+    if repo.repo_uuid != repo_uuid {
+        return Ok(Response::Error(format!(
+            "unknown repo_uuid: requested={}, available={}",
+            to_hex(&repo_uuid),
+            to_hex(&repo.repo_uuid)
+        )));
+    }
     let mut chunks = Vec::new();
     for id in repo.chunks.keys() {
         let data = std::fs::read(format!(".syncup/chunks/{}", to_hex(&id.0)))
             .with_context(|| format!("missing chunk {}", to_hex(&id.0)))?;
         chunks.push((*id, data));
     }
-    Ok(Response::Pull { repository: repo, chunks })
+    Ok(Response::Pull {
+        repository: repo,
+        chunks,
+    })
 }
 
-fn handle_push(repository: Repository, chunks: Vec<(ObjectId, Vec<u8>)>) -> Result<Response> {
-    std::fs::create_dir_all(".syncup/chunks")?;
+fn handle_push(
+    repo_uuid: [u8; 32],
+    repository: Repository,
+    chunks: Vec<(ObjectId, Vec<u8>)>,
+) -> Result<Response> {
+    if repository.repo_uuid != repo_uuid {
+        return Ok(Response::Error(format!(
+            "push repo_uuid mismatch: request={}, payload={}",
+            to_hex(&repo_uuid),
+            to_hex(&repository.repo_uuid)
+        )));
+    }
+
+    let base = std::path::Path::new(".");
+    let current = Repository::load(base);
+    if current.repo_uuid != repo_uuid {
+        return Ok(Response::Error(format!(
+            "unknown repo_uuid: requested={}, available={}",
+            to_hex(&repo_uuid),
+            to_hex(&current.repo_uuid)
+        )));
+    }
+
+    std::fs::create_dir_all(base.join(".syncup/chunks"))?;
     for (id, data) in &chunks {
-        let path = format!(".syncup/chunks/{}", to_hex(&id.0));
-        if !std::path::Path::new(&path).exists() {
-            std::fs::write(&path, data)?;
+        let path = base.join(format!(".syncup/chunks/{}", to_hex(&id.0)));
+        if !path.exists() {
+            std::fs::write(path, data)?;
         }
     }
-    std::fs::write(".syncup/repository", postcard::to_allocvec(&repository)?)?;
+
+    let mut local = Repository::load(base);
+    local.merge(repository);
+    local.save(base);
     Ok(Response::PushOk)
 }
 
@@ -149,20 +210,30 @@ fn load_host_key() -> Result<KeyPair> {
     }
 
     // russh-keys has no key-write API, so generate an ephemeral key and warn.
-    eprintln!("warning: ~/.ssh/id_ed25519 not found; using an ephemeral host key (fingerprint changes on restart)");
+    eprintln!(
+        "warning: ~/.ssh/id_ed25519 not found; using an ephemeral host key (fingerprint changes on restart)"
+    );
     KeyPair::generate_ed25519().context("key generation failed")
 }
 
-// ── mDNS server discovery ───────────────────────────────────────────────────
+// ── mDNS server scan ────────────────────────────────────────────────────────
 
 const MDNS_SERVICE_TYPE: &str = "_syncup._tcp.local.";
 
-fn advertise_mdns(port: u16) -> Result<ServiceDaemon> {
+fn advertise_mdns(port: u16, repo_uuids: &[[u8; 32]]) -> Result<ServiceDaemon> {
     let mdns = ServiceDaemon::new().context("failed to start mDNS daemon")?;
 
     let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "syncup".to_string());
     let instance_name = format!("syncup-{hostname}");
     let host_name = format!("{hostname}.local.");
+
+    let mut properties = HashMap::new();
+    let repo_list = repo_uuids
+        .iter()
+        .map(|id| to_hex(id))
+        .collect::<Vec<_>>()
+        .join(",");
+    properties.insert("repos".to_string(), repo_list);
 
     let service = ServiceInfo::new(
         MDNS_SERVICE_TYPE,
@@ -170,10 +241,10 @@ fn advertise_mdns(port: u16) -> Result<ServiceDaemon> {
         &host_name,
         "",
         port,
-        None,
+        properties,
     )
-        .context("failed to build mDNS service info")?
-        .enable_addr_auto();
+    .context("failed to build mDNS service info")?
+    .enable_addr_auto();
 
     mdns.register(service)
         .context("failed to register mDNS service")?;
@@ -186,12 +257,17 @@ fn advertise_mdns(port: u16) -> Result<ServiceDaemon> {
 
 pub async fn serve(port: u16) -> Result<()> {
     let config = Arc::new(russh::server::Config {
-        server_id: russh::SshId::Standard("syncup-ssh".into()),
+        // RFC 4253: identification string must start with "SSH-2.0-".
+        server_id: russh::SshId::Standard("SSH-2.0-syncup-ssh".into()),
         keys: vec![load_host_key()?],
         ..Default::default()
     });
 
-    let _mdns = advertise_mdns(port)?;
+    let repo_uuids = load_repository()
+        .map(|r| vec![r.repo_uuid])
+        .unwrap_or_else(|_| Vec::new());
+
+    let _mdns = advertise_mdns(port, &repo_uuids)?;
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     println!("Listening on 0.0.0.0:{port}");
@@ -204,7 +280,10 @@ pub async fn serve(port: u16) -> Result<()> {
         tokio::spawn(async move {
             let session = match russh::server::run_stream(config, stream, handler).await {
                 Ok(s) => s,
-                Err(e) => { eprintln!("Handshake error [{addr}]: {e:#}"); return; }
+                Err(e) => {
+                    eprintln!("Handshake error [{addr}]: {e:#}");
+                    return;
+                }
             };
             if let Err(e) = session.await {
                 eprintln!("Session error [{addr}]: {e:#}");
