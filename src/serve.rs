@@ -8,7 +8,7 @@ use russh_keys::key::KeyPair;
 use std::{path::PathBuf, sync::Arc};
 
 use crate::protocol::{Request, Response};
-use crate::{ObjectId, Repository, to_hex};
+use crate::{Object, ObjectId, Repository, to_hex};
 
 // ── Server / handler boilerplate ─────────────────────────────────────────────
 
@@ -150,7 +150,10 @@ fn handle_pull(repo_uuid: [u8; 32]) -> Result<Response> {
         )));
     }
     let mut chunks = Vec::new();
-    for id in repo.chunks.keys() {
+    for (id, obj) in &repo.objects {
+        if !matches!(obj, Object::Chunk(_)) {
+            continue;
+        }
         let data = std::fs::read(format!(".syncup/chunks/{}", to_hex(&id.0)))
             .with_context(|| format!("missing chunk {}", to_hex(&id.0)))?;
         chunks.push((*id, data));

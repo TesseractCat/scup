@@ -18,7 +18,7 @@ mod cli;
 use cli::cli;
 
 mod model;
-pub use model::{Blob, Chunk, Object, ObjectId, Repository, Snapshot, Map, to_hex};
+pub use model::{Blob, Chunk, List, Map, Object, ObjectId, Repository, Snapshot, to_hex};
 
 mod scan;
 mod protocol;
@@ -35,7 +35,7 @@ struct ChunkReader<R: Read> {
 }
 
 impl<R: Read> Iterator for ChunkReader<R> {
-    type Item = std::io::Result<(ObjectId, Vec<u8>)>;
+    type Item = std::io::Result<(ObjectId, Vec<u8>, u64)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
@@ -60,7 +60,7 @@ impl<R: Read> Iterator for ChunkReader<R> {
                             Vec::with_capacity(rollsum::AVERAGE_CHUNK_SIZE),
                         );
                         let id: ObjectId = <[u8; 32]>::from(Sha256::digest(&data)).into();
-                        Some(Ok((id, data)))
+                        Some(Ok((id, data, self.rs.digest())))
                     };
                 }
             }
@@ -83,7 +83,7 @@ impl<R: Read> Iterator for ChunkReader<R> {
                     );
                     let id: ObjectId = <[u8; 32]>::from(Sha256::digest(&data)).into();
                     //let id: ObjectId = ObjectId([0; 32]);
-                    return Some(Ok((id, data)));
+                    return Some(Ok((id, data, self.rs.digest())));
                 }
             }
             // No boundary in this buffer — bulk copy and refill.
@@ -105,18 +105,25 @@ fn split_chunks<R: Read>(reader: R) -> ChunkReader<R> {
     }
 }
 
-fn blob_object_id(chunk_ids: &[ObjectId]) -> ObjectId {
+fn list_object_id(entries: &[ObjectId]) -> ObjectId {
     let mut h = Sha256::new();
-    h.update(b"blob");
-    for id in chunk_ids {
+    h.update(b"list");
+    for id in entries {
         h.update(id);
     }
     <[u8; 32]>::from(h.finalize()).into()
 }
 
-fn tree_object_id(files: &BTreeMap<String, ObjectId>) -> ObjectId {
+fn blob_object_id(list_id: ObjectId) -> ObjectId {
     let mut h = Sha256::new();
-    h.update(b"tree");
+    h.update(b"blob");
+    h.update(list_id);
+    <[u8; 32]>::from(h.finalize()).into()
+}
+
+fn map_object_id(files: &BTreeMap<String, ObjectId>) -> ObjectId {
+    let mut h = Sha256::new();
+    h.update(b"map");
     let mut entries: Vec<_> = files.iter().collect();
     entries.sort_by_key(|(name, _)| name.as_str());
     for (name, id) in entries {
@@ -125,6 +132,80 @@ fn tree_object_id(files: &BTreeMap<String, ObjectId>) -> ObjectId {
         h.update(id);
     }
     <[u8; 32]>::from(h.finalize()).into()
+}
+
+fn build_fanout_list(repo: &mut Repository, leaves: &[(ObjectId, u64)]) -> ObjectId {
+    if leaves.is_empty() {
+        let id = list_object_id(&[]);
+        repo.objects
+            .entry(id)
+            .or_insert_with(|| Object::List(List { entries: vec![] }));
+        return id;
+    }
+
+    if leaves.len() == 1 {
+        let id = list_object_id(&[leaves[0].0]);
+        repo.objects.entry(id).or_insert_with(|| {
+            Object::List(List {
+                entries: vec![leaves[0].0],
+            })
+        });
+        return id;
+    }
+
+    let mut level: Vec<(ObjectId, u64)> = leaves.to_vec();
+
+    for (fan_level, mask) in rollsum::FAN_MASKS.iter().enumerate() {
+        if level.len() <= 1 {
+            break;
+        }
+
+        let mut grouped: Vec<(ObjectId, u64)> = Vec::new();
+        let mut bucket: Vec<ObjectId> = Vec::new();
+
+        for (id, digest) in &level {
+            bucket.push(*id);
+            if (*digest & *mask) == *mask {
+                let list_id = list_object_id(&bucket);
+                repo.objects
+                    .entry(list_id)
+                    .or_insert_with(|| Object::List(List { entries: bucket.clone() }));
+                grouped.push((list_id, *digest));
+                bucket.clear();
+            }
+        }
+
+        if !bucket.is_empty() {
+            let list_id = list_object_id(&bucket);
+            repo.objects
+                .entry(list_id)
+                .or_insert_with(|| Object::List(List { entries: bucket.clone() }));
+            let digest = level.last().map(|(_, d)| *d).unwrap_or(0);
+            grouped.push((list_id, digest));
+        }
+
+        level = grouped;
+
+        if level.len() == 1 {
+            break;
+        }
+
+        if fan_level == rollsum::FAN_MASKS.len() - 1 {
+            break;
+        }
+    }
+
+    while level.len() > 1 {
+        let ids: Vec<ObjectId> = level.iter().map(|(id, _)| *id).collect();
+        let top_id = list_object_id(&ids);
+        repo.objects
+            .entry(top_id)
+            .or_insert_with(|| Object::List(List { entries: ids }));
+        let digest = level.last().map(|(_, d)| *d).unwrap_or(0);
+        level = vec![(top_id, digest)];
+    }
+
+    level[0].0
 }
 
 fn snapshot_object_id(snap: &Snapshot) -> ObjectId {
@@ -147,11 +228,11 @@ fn snapshot_object_id(snap: &Snapshot) -> ObjectId {
 }
 
 impl Repository {
-    fn tree_files_for_snapshot(&self, snapshot_id: ObjectId) -> BTreeMap<String, ObjectId> {
+    fn map_entries_for_snapshot(&self, snapshot_id: ObjectId) -> BTreeMap<String, ObjectId> {
         let Some(Object::Snapshot(snap)) = self.objects.get(&snapshot_id) else {
             return BTreeMap::new();
         };
-        let Some(Object::Tree(tree)) = self.objects.get(&snap.tree) else {
+        let Some(Object::Map(tree)) = self.objects.get(&snap.tree) else {
             return BTreeMap::new();
         };
         tree.entries.clone()
@@ -176,15 +257,12 @@ impl Repository {
             return;
         }
 
-        for (id, chunk) in incoming.chunks {
-            self.chunks.insert(id, chunk);
-        }
         for (id, obj) in incoming.objects {
             self.objects.insert(id, obj);
         }
 
-        let local_files = self.tree_files_for_snapshot(local_head);
-        let remote_files = self.tree_files_for_snapshot(remote_head);
+        let local_files = self.map_entries_for_snapshot(local_head);
+        let remote_files = self.map_entries_for_snapshot(remote_head);
 
         let mut merged_files: BTreeMap<String, ObjectId> = BTreeMap::new();
         let mut all_paths: BTreeMap<String, ()> = BTreeMap::new();
@@ -227,9 +305,9 @@ impl Repository {
             }
         }
 
-        let merged_tree_id = tree_object_id(&merged_files);
+        let merged_map_id = map_object_id(&merged_files);
         self.objects
-            .insert(merged_tree_id, Object::Tree(Map { entries: merged_files }));
+            .insert(merged_map_id, Object::Map(Map { entries: merged_files }));
 
         let mut parents = vec![local_head, remote_head];
         parents.sort();
@@ -237,7 +315,7 @@ impl Repository {
 
         let merged_snapshot = Snapshot {
             parents,
-            tree: merged_tree_id,
+            tree: merged_map_id,
             message: Some("Merge".to_string()),
             date: SystemTime::now(),
         };
@@ -255,7 +333,6 @@ impl Repository {
 
         let mut repo = Repository {
             repo_uuid,
-            chunks: BTreeMap::new(),
             objects: BTreeMap::new(),
             head: ObjectId([0u8; 32]),
         };
@@ -272,7 +349,7 @@ impl Repository {
         let prev_tree: BTreeMap<String, (Option<SystemTime>, ObjectId)> = {
             if let Some(Object::Snapshot(snap)) = self.objects.get(&self.head) {
                 let tree_id = snap.tree;
-                if let Some(Object::Tree(tree)) = self.objects.get(&tree_id) {
+                if let Some(Object::Map(tree)) = self.objects.get(&tree_id) {
                     tree.entries
                         .iter()
                         .map(|(path, &blob_id)| {
@@ -317,7 +394,7 @@ impl Repository {
 
             let file =
                 std::fs::File::open(path).unwrap_or_else(|_| panic!("failed to open {path:?}"));
-            let mut chunk_ids: Vec<ObjectId> = Vec::new();
+            let mut chunk_leaves: Vec<(ObjectId, u64)> = Vec::new();
 
             let size = metadata.len() as usize;
             let chunks = size / rollsum::AVERAGE_CHUNK_SIZE;
@@ -327,23 +404,25 @@ impl Repository {
                 total = chunks,
                 position = 1
             ) {
-                let (id, data) = chunk.unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
-                chunk_ids.push(id);
-                self.chunks.entry(id).or_insert_with(|| {
+                let (id, data, digest) =
+                    chunk.unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
+                chunk_leaves.push((id, digest));
+                self.objects.entry(id).or_insert_with(|| {
                     std::fs::write(
                         base.join(format!(".syncup/chunks/{}", to_hex(&id.0))),
                         &data,
                     )
                     .expect("failed to write chunk");
-                    Chunk
+                    Object::Chunk(Chunk)
                 });
             }
 
-            let bid = blob_object_id(&chunk_ids);
+            let list_id = build_fanout_list(self, &chunk_leaves);
+            let bid = blob_object_id(list_id);
             self.objects.insert(
                 bid,
                 Object::Blob(Blob {
-                    chunks: chunk_ids,
+                    chunks: list_id,
                     created_time: metadata.created().ok(),
                     modified_time: mtime,
                     accessed_time: metadata.accessed().ok(),
@@ -353,9 +432,9 @@ impl Repository {
             tree_files.insert(rel_path, bid);
         }
 
-        let tid = tree_object_id(&tree_files);
+        let tid = map_object_id(&tree_files);
         self.objects
-            .insert(tid, Object::Tree(Map { entries: tree_files }));
+            .insert(tid, Object::Map(Map { entries: tree_files }));
 
         let snap = Snapshot {
             parents: if self.head.0.iter().all(|x| *x == 0) { vec![] } else { vec![self.head]},
@@ -396,7 +475,7 @@ fn chunk_file(path: &Path) {
         total = chunks,
         position = 1
     ) {
-        let (_id, data) = chunk.expect("failed to read file");
+        let (_id, data, _digest) = chunk.expect("failed to read file");
         let end = offset + data.len();
         //println!("chunk [{offset}, {end}), len={}", data.len());
         offset = end;
@@ -548,7 +627,11 @@ async fn push_all(base: &Path) -> anyhow::Result<()> {
         merged.merge(remote_repo.clone());
 
         let mut chunks_payload = Vec::new();
-        for id in merged.chunks.keys() {
+        for (id, obj) in &merged.objects {
+            if !matches!(obj, Object::Chunk(_)) {
+                continue;
+            }
+
             let mut data = None;
 
             if let Some((_, bytes)) = remote_chunks.iter().find(|(cid, _)| cid == id) {

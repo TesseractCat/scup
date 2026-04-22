@@ -47,8 +47,8 @@ impl Debug for Blob {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Blob of length {} chunks [modified {:?} ago]",
-            self.chunks.len(),
+            "Blob(list={:?}, modified {:?} ago)",
+            self.chunks,
             self.modified_time
                 .and_then(|t| t.elapsed().ok())
                 .unwrap_or_default()

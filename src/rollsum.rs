@@ -315,12 +315,6 @@ impl Rollsum {
         self.fp = (self.fp << 1).wrapping_add(GEARHASH_TABLE[ch as usize]);
     }
 
-    pub fn sum(&mut self, buffer: &[u8]) {
-        for i in 0..buffer.len() {
-            self.roll(buffer[i]);
-        }
-    }
-
     pub fn digest(&self) -> u64 {
         return self.fp;
     }

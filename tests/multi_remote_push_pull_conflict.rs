@@ -1,7 +1,7 @@
 #[path = "../src/model.rs"]
 mod model;
 
-use model::{Blob, Object, Repository, Tree, to_hex};
+use model::{Blob, List, Map, Object, ObjectId, Repository, to_hex};
 use std::fs;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -108,21 +108,21 @@ fn read_repo(dir: &Path) -> Repository {
     postcard::from_bytes(&bytes).expect("failed to deserialize repository")
 }
 
-fn head_tree(repo: &Repository) -> &Tree {
+fn head_tree(repo: &Repository) -> &Map {
     let snap = match repo.objects.get(&repo.head) {
         Some(Object::Snapshot(s)) => s,
         _ => panic!("head is not a snapshot"),
     };
     match repo.objects.get(&snap.tree) {
-        Some(Object::Tree(t)) => t,
-        _ => panic!("snapshot tree missing"),
+        Some(Object::Map(t)) => t,
+        _ => panic!("snapshot map missing"),
     }
 }
 
 fn blob_for_file<'a>(repo: &'a Repository, filename: &str) -> &'a Blob {
     let tree = head_tree(repo);
     let (_, blob_id) = tree
-        .files
+        .entries
         .iter()
         .find(|(path, _)| path.as_str() == filename || path.ends_with(&format!("/{filename}")) || path.as_str() == format!("./{filename}"))
         .unwrap_or_else(|| panic!("file not found in head tree: {filename}"));
@@ -133,10 +133,28 @@ fn blob_for_file<'a>(repo: &'a Repository, filename: &str) -> &'a Blob {
     }
 }
 
+fn collect_chunk_ids(repo: &Repository, list_id: ObjectId, out: &mut Vec<ObjectId>) {
+    let list = match repo.objects.get(&list_id) {
+        Some(Object::List(List { entries })) => entries,
+        _ => panic!("missing list object: {}", to_hex(&list_id.0)),
+    };
+
+    for entry in list {
+        match repo.objects.get(entry) {
+            Some(Object::Chunk(_)) => out.push(*entry),
+            Some(Object::List(_)) => collect_chunk_ids(repo, *entry, out),
+            _ => panic!("list entry is neither chunk nor list"),
+        }
+    }
+}
+
 fn file_content_from_repo(dir: &Path, repo: &Repository, filename: &str) -> Vec<u8> {
     let blob = blob_for_file(repo, filename);
+    let mut chunk_ids = Vec::new();
+    collect_chunk_ids(repo, blob.chunks, &mut chunk_ids);
+
     let mut out = Vec::new();
-    for id in &blob.chunks {
+    for id in chunk_ids {
         let path = dir.join(format!(".syncup/chunks/{}", to_hex(&id.0)));
         let bytes = fs::read(path).expect("failed to read chunk");
         out.extend_from_slice(&bytes);
@@ -232,8 +250,8 @@ fn push_pull_multiple_remotes_then_conflict() {
     let r2_repo = read_repo(&remote2);
     let r1_tree = head_tree(&r1_repo);
     let r2_tree = head_tree(&r2_repo);
-    assert!(r1_tree.files.keys().any(|p| p.ends_with("from_local.txt") || p == "from_local.txt" || p == "./from_local.txt"));
-    assert!(r2_tree.files.keys().any(|p| p.ends_with("from_local.txt") || p == "from_local.txt" || p == "./from_local.txt"));
+    assert!(r1_tree.entries.keys().any(|p| p.ends_with("from_local.txt") || p == "from_local.txt" || p == "./from_local.txt"));
+    assert!(r2_tree.entries.keys().any(|p| p.ends_with("from_local.txt") || p == "from_local.txt" || p == "./from_local.txt"));
 
     // 2) Standard pull from one remote (still through multi-remote pull command).
     fs::write(remote1.join("from_remote1.txt"), b"hello from remote1\n")
@@ -263,7 +281,7 @@ fn push_pull_multiple_remotes_then_conflict() {
     let local_tree_after_pull = head_tree(&local_repo_after_pull);
     assert!(
         local_tree_after_pull
-            .files
+            .entries
             .keys()
             .any(|p| p.ends_with("from_remote1.txt") || p == "from_remote1.txt" || p == "./from_remote1.txt"),
         "local repo missing file from remote1 after pull"
