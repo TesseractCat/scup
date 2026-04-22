@@ -56,7 +56,19 @@ struct ChildGuard(Child);
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
-        let _ = self.0.wait();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.0.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+                _ => {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -114,16 +126,17 @@ fn init_serve_scan_and_get_status() {
     let host_tag = format!("syncup-test-{}", std::process::id());
     let expected_fullname = format!("syncup-{host_tag}._syncup._tcp.local.");
 
-    let child = Command::new(bin())
-        .arg("serve")
-        .arg("--port")
-        .arg(port.to_string())
-        .env("HOSTNAME", &host_tag)
-        .current_dir(&repo_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn syncup serve");
+    let child = {
+        let mut cmd = Command::new(bin());
+        cmd.arg("serve")
+            .arg("--port")
+            .arg(port.to_string())
+            .env("HOSTNAME", &host_tag)
+            .current_dir(&repo_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.spawn().expect("failed to spawn syncup serve")
+    };
     let child = ChildGuard(child);
 
     wait_for_tcp(("127.0.0.1", port), Duration::from_secs(10));

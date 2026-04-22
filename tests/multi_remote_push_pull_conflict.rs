@@ -98,7 +98,19 @@ struct ChildGuard(Child);
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
-        let _ = self.0.wait();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.0.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+                _ => {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -193,31 +205,29 @@ fn push_pull_multiple_remotes_then_conflict() {
     let full1 = format!("syncup-{host1}._syncup._tcp.local.");
     let full2 = format!("syncup-{host2}._syncup._tcp.local.");
 
-    let server1 = ChildGuard(
-        Command::new(bin())
-            .current_dir(&remote1)
+    let server1 = ChildGuard({
+        let mut cmd = Command::new(bin());
+        cmd.current_dir(&remote1)
             .env("HOSTNAME", &host1)
             .arg("serve")
             .arg("--port")
             .arg(port1.to_string())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to start server1"),
-    );
+            .stderr(Stdio::piped());
+        cmd.spawn().expect("failed to start server1")
+    });
 
-    let server2 = ChildGuard(
-        Command::new(bin())
-            .current_dir(&remote2)
+    let server2 = ChildGuard({
+        let mut cmd = Command::new(bin());
+        cmd.current_dir(&remote2)
             .env("HOSTNAME", &host2)
             .arg("serve")
             .arg("--port")
             .arg(port2.to_string())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to start server2"),
-    );
+            .stderr(Stdio::piped());
+        cmd.spawn().expect("failed to start server2")
+    });
 
     wait_for_tcp(("127.0.0.1", port1), Duration::from_secs(10));
     wait_for_tcp(("127.0.0.1", port2), Duration::from_secs(10));
