@@ -4,7 +4,7 @@ use postcard;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::Read,
     path::{Path, PathBuf},
     sync::Arc,
@@ -482,7 +482,19 @@ fn chunk_file(path: &Path) {
     }
 }
 
-struct DebugStatusClient;
+struct DebugStatusClient {
+    base: PathBuf,
+    reverse_buffers: BTreeMap<russh::ChannelId, Vec<u8>>,
+}
+
+impl DebugStatusClient {
+    fn new(base: PathBuf) -> Self {
+        Self {
+            base,
+            reverse_buffers: BTreeMap::new(),
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl russh::client::Handler for DebugStatusClient {
@@ -494,10 +506,49 @@ impl russh::client::Handler for DebugStatusClient {
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
+
+    async fn server_channel_open_session(
+        &mut self,
+        channel: russh::ChannelId,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        self.reverse_buffers.entry(channel).or_default();
+        Ok(())
+    }
+
+    async fn data(
+        &mut self,
+        channel: russh::ChannelId,
+        data: &[u8],
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(buf) = self.reverse_buffers.get_mut(&channel) {
+            buf.extend_from_slice(data);
+        }
+        Ok(())
+    }
+
+    async fn channel_eof(
+        &mut self,
+        channel: russh::ChannelId,
+        session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        let Some(buf) = self.reverse_buffers.remove(&channel) else {
+            return Ok(());
+        };
+
+        let req: protocol::Request = postcard::from_bytes(&buf)?;
+        let response = local_pull_response(&self.base, req);
+        let bytes = postcard::to_allocvec(&response)?;
+        let _ = session.data(channel, bytes.into());
+        let _ = session.close(channel);
+        Ok(())
+    }
 }
 
-async fn connect_and_auth(
+pub(crate) async fn connect_and_auth(
     host: &scan::ScannedHost,
+    base: &Path,
 ) -> anyhow::Result<russh::client::Handle<DebugStatusClient>> {
     let addr = *host
         .addrs
@@ -509,7 +560,9 @@ async fn connect_and_auth(
         ..Default::default()
     });
 
-    let mut session = russh::client::connect(config, (addr, host.port), DebugStatusClient).await?;
+    let mut session =
+        russh::client::connect(config, (addr, host.port), DebugStatusClient::new(base.to_path_buf()))
+            .await?;
     let auth_ok = session
         .authenticate_publickey(
             "syncup",
@@ -530,8 +583,9 @@ async fn rpc(
     host: &scan::ScannedHost,
     command: &str,
     request: Option<&protocol::Request>,
+    base: &Path,
 ) -> anyhow::Result<protocol::Response> {
-    let session = connect_and_auth(host).await?;
+    let session = connect_and_auth(host, base).await?;
 
     let mut channel = session.channel_open_session().await?;
     channel.exec(false, command).await?;
@@ -548,6 +602,7 @@ async fn rpc(
             raw.extend_from_slice(&data);
         }
     }
+    let _ = channel.close().await;
 
     let _ = session
         .disconnect(russh::Disconnect::ByApplication, "", "English")
@@ -563,7 +618,7 @@ async fn rpc(
 async fn debug_status(host_id: &str) -> anyhow::Result<()> {
     let host = scan::resolve_host(host_id, 3)?;
 
-    let response = rpc(&host, "status", None).await?;
+    let response = rpc(&host, "status", None, Path::new(".")).await?;
     match response {
         protocol::Response::Status { head } => {
             println!("- {} status: head={}", host.fullname, to_hex(&head.0));
@@ -579,18 +634,173 @@ async fn debug_status(host_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn merge_remote_into_local(base: &Path, remote: Repository, chunks: Vec<(ObjectId, Vec<u8>)>) {
-    std::fs::create_dir_all(base.join(".syncup/chunks")).expect("failed to create .syncup/chunks");
-    for (id, data) in chunks {
-        let chunk_path = base.join(format!(".syncup/chunks/{}", to_hex(&id.0)));
-        if !chunk_path.exists() {
-            std::fs::write(chunk_path, data).expect("failed to write chunk");
+pub(crate) fn object_refs(obj: &Object) -> Vec<ObjectId> {
+    match obj {
+        Object::Chunk(_) => vec![],
+        Object::Blob(b) => vec![b.chunks],
+        Object::Map(m) => m.entries.values().copied().collect(),
+        Object::List(l) => l.entries.clone(),
+        Object::Snapshot(s) => {
+            let mut out = Vec::with_capacity(1 + s.parents.len());
+            out.push(s.tree);
+            out.extend_from_slice(&s.parents);
+            out
+        }
+    }
+}
+
+pub(crate) fn local_pull_response(base: &Path, req: protocol::Request) -> protocol::Response {
+    let repo = Repository::load(base);
+    let repo_uuid = repo.repo_uuid;
+
+    let ensure = |requested: [u8; 32]| -> Result<Repository, String> {
+        if requested != repo_uuid {
+            Err(format!(
+                "unknown repo_uuid: requested={}, available={}",
+                to_hex(&requested),
+                to_hex(&repo_uuid)
+            ))
+        } else {
+            Ok(repo.clone())
+        }
+    };
+
+    match req {
+        protocol::Request::PullSnapshotIds { repo_uuid } => match ensure(repo_uuid) {
+            Ok(repo) => {
+                let snapshot_ids = repo
+                    .objects
+                    .iter()
+                    .filter_map(|(id, obj)| match obj {
+                        Object::Snapshot(_) => Some(*id),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                protocol::Response::PullSnapshotIds {
+                    head: repo.head,
+                    snapshot_ids,
+                }
+            }
+            Err(err) => protocol::Response::Error(err),
+        },
+        protocol::Request::PullObjects {
+            repo_uuid,
+            object_ids,
+        } => match ensure(repo_uuid) {
+            Ok(repo) => {
+                let mut objects = Vec::new();
+                let mut chunks = Vec::new();
+                for id in object_ids {
+                    if let Some(obj) = repo.objects.get(&id) {
+                        objects.push((id, obj.clone()));
+                        if matches!(obj, Object::Chunk(_)) {
+                            let path = base.join(format!(".syncup/chunks/{}", to_hex(&id.0)));
+                            if let Ok(bytes) = std::fs::read(path) {
+                                chunks.push((id, bytes));
+                            }
+                        }
+                    }
+                }
+                protocol::Response::PullObjects { objects, chunks }
+            }
+            Err(err) => protocol::Response::Error(err),
+        },
+        _ => protocol::Response::Error("unsupported local pull request".into()),
+    }
+}
+
+pub(crate) async fn pull_and_merge_from_host(
+    base: &Path,
+    host: &scan::ScannedHost,
+) -> anyhow::Result<()> {
+    pull_and_merge_with(base, |req| async move {
+        rpc(host, "pull", Some(&req), base).await
+    })
+    .await
+}
+
+pub(crate) async fn pull_and_merge_with<F, Fut>(
+    base: &Path,
+    mut send: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(protocol::Request) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<protocol::Response>>,
+{
+    let local = Repository::load(base);
+    let local_object_ids: BTreeSet<ObjectId> = local.objects.keys().copied().collect();
+
+    let response = send(protocol::Request::PullSnapshotIds {
+        repo_uuid: local.repo_uuid,
+    })
+    .await?;
+
+    let (remote_head, snapshot_ids) = match response {
+        protocol::Response::PullSnapshotIds { head, snapshot_ids } => (head, snapshot_ids),
+        protocol::Response::Error(err) => anyhow::bail!("snapshot id pull failed: {err}"),
+        _ => anyhow::bail!("unexpected response to PullSnapshotIds"),
+    };
+
+    let mut need: BTreeSet<ObjectId> = snapshot_ids
+        .into_iter()
+        .filter(|id| !local_object_ids.contains(id))
+        .collect();
+
+    let mut fetched_objects: BTreeMap<ObjectId, Object> = BTreeMap::new();
+    let mut fetched_chunks: BTreeMap<ObjectId, Vec<u8>> = BTreeMap::new();
+
+    while !need.is_empty() {
+        let req_ids: Vec<ObjectId> = need.iter().copied().collect();
+        need.clear();
+
+        let response = send(protocol::Request::PullObjects {
+            repo_uuid: local.repo_uuid,
+            object_ids: req_ids,
+        })
+        .await?;
+
+        let (objects, chunks) = match response {
+            protocol::Response::PullObjects { objects, chunks } => (objects, chunks),
+            protocol::Response::Error(err) => anyhow::bail!("object pull failed: {err}"),
+            _ => anyhow::bail!("unexpected response to PullObjects"),
+        };
+
+        for (id, data) in chunks {
+            fetched_chunks.entry(id).or_insert(data);
+        }
+
+        for (id, obj) in objects {
+            if local_object_ids.contains(&id) || fetched_objects.contains_key(&id) {
+                continue;
+            }
+            for child in object_refs(&obj) {
+                if !local_object_ids.contains(&child) && !fetched_objects.contains_key(&child) {
+                    need.insert(child);
+                }
+            }
+            fetched_objects.insert(id, obj);
         }
     }
 
-    let mut local = Repository::load(base);
-    local.merge(remote);
-    local.save(base);
+    std::fs::create_dir_all(base.join(".syncup/chunks")).expect("failed to create .syncup/chunks");
+    for (id, data) in fetched_chunks {
+        let path = base.join(format!(".syncup/chunks/{}", to_hex(&id.0)));
+        if !path.exists() {
+            std::fs::write(path, data).expect("failed to write chunk");
+        }
+    }
+
+    let mut remote_repo = local.clone();
+    for (id, obj) in fetched_objects {
+        remote_repo.objects.insert(id, obj);
+    }
+    remote_repo.head = remote_head;
+
+    let mut merged = Repository::load(base);
+    merged.merge(remote_repo.clone());
+    merged.save(base);
+
+    Ok(())
 }
 
 async fn push_all(base: &Path) -> anyhow::Result<()> {
@@ -604,71 +814,23 @@ async fn push_all(base: &Path) -> anyhow::Result<()> {
 
         let response = rpc(
             &host,
-            "pull",
-            Some(&protocol::Request::Pull {
-                repo_uuid: local.repo_uuid,
-            }),
-        )
-        .await?;
-
-        let (remote_repo, remote_chunks) = match response {
-            protocol::Response::Pull { repository, chunks } => (repository, chunks),
-            protocol::Response::Error(err) => {
-                println!("- {} pull failed: {}", host.fullname, err);
-                continue;
-            }
-            _ => {
-                println!("- {} returned unexpected response to pull", host.fullname);
-                continue;
-            }
-        };
-
-        let mut merged = local.clone();
-        merged.merge(remote_repo.clone());
-
-        let mut chunks_payload = Vec::new();
-        for (id, obj) in &merged.objects {
-            if !matches!(obj, Object::Chunk(_)) {
-                continue;
-            }
-
-            let mut data = None;
-
-            if let Some((_, bytes)) = remote_chunks.iter().find(|(cid, _)| cid == id) {
-                data = Some(bytes.clone());
-            } else {
-                let path = base.join(format!(".syncup/chunks/{}", to_hex(&id.0)));
-                if let Ok(bytes) = std::fs::read(path) {
-                    data = Some(bytes);
-                }
-            }
-
-            if let Some(bytes) = data {
-                chunks_payload.push((*id, bytes));
-            }
-        }
-
-        let response = rpc(
-            &host,
             "push",
             Some(&protocol::Request::Push {
-                repo_uuid: merged.repo_uuid,
-                repository: merged,
-                chunks: chunks_payload,
+                repo_uuid: local.repo_uuid,
             }),
+            base,
         )
-        .await?;
+        .await;
 
         match response {
-            protocol::Response::PushOk => {
-                println!("- pushed to {}", host.fullname);
+            Ok(protocol::Response::PushComplete) => {
+                println!("- pushed to {}", host.fullname)
             }
-            protocol::Response::Error(err) => {
-                println!("- push to {} failed: {}", host.fullname, err);
+            Ok(protocol::Response::Error(err)) => {
+                println!("- push to {} failed: {}", host.fullname, err)
             }
-            _ => {
-                println!("- {} returned unexpected response to push", host.fullname);
-            }
+            Ok(_) => println!("- {} returned unexpected response to push", host.fullname),
+            Err(err) => println!("- push to {} failed: {}", host.fullname, err),
         }
     }
 
@@ -684,26 +846,9 @@ async fn pull_all(base: &Path) -> anyhow::Result<()> {
             continue;
         }
 
-        let response = rpc(
-            &host,
-            "pull",
-            Some(&protocol::Request::Pull {
-                repo_uuid: local.repo_uuid,
-            }),
-        )
-        .await?;
-
-        match response {
-            protocol::Response::Pull { repository, chunks } => {
-                merge_remote_into_local(base, repository, chunks);
-                println!("- pulled from {}", host.fullname);
-            }
-            protocol::Response::Error(err) => {
-                println!("- pull from {} failed: {}", host.fullname, err);
-            }
-            _ => {
-                println!("- {} returned unexpected response to pull", host.fullname);
-            }
+        match pull_and_merge_from_host(base, &host).await {
+            Ok(()) => println!("- pulled from {}", host.fullname),
+            Err(err) => println!("- pull from {} failed: {}", host.fullname, err),
         }
     }
 

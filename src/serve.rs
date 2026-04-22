@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use russh::ChannelId;
-use russh::server::{Auth, Handler, Server, Session};
+use russh::server::{Auth, Handle, Handler, Server, Session};
 use russh_keys::key::KeyPair;
 use std::{path::PathBuf, sync::Arc};
 
@@ -19,18 +19,15 @@ impl Server for SyncupServer {
     fn new_client(&mut self, _addr: Option<std::net::SocketAddr>) -> Self::Handler {
         ConnectionHandler {
             pending_request: None,
+            pending_command: None,
         }
     }
 }
 
-enum PendingRequest {
-    Pull(Vec<u8>),
-    Push(Vec<u8>),
-}
-
 /// Per-connection state. `pending_request` is `Some` while accumulating request payload bytes.
 struct ConnectionHandler {
-    pending_request: Option<PendingRequest>,
+    pending_request: Option<Vec<u8>>,
+    pending_command: Option<String>,
 }
 
 #[async_trait]
@@ -66,8 +63,13 @@ impl Handler for ConnectionHandler {
     ) -> Result<()> {
         match std::str::from_utf8(data)? {
             "status" => send_response(channel, session, &handle_status()?)?,
-            "pull" => self.pending_request = Some(PendingRequest::Pull(Vec::new())),
-            "push" => self.pending_request = Some(PendingRequest::Push(Vec::new())),
+            "pull" | "push" => {
+                self.pending_command = Some(std::str::from_utf8(data)?.to_string());
+                self.pending_request = Some(Vec::new());
+                if data.is_empty() {
+                    return Ok(());
+                }
+            }
             cmd => {
                 send_response(
                     channel,
@@ -86,32 +88,47 @@ impl Handler for ConnectionHandler {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<()> {
-        if let Some(pending) = &mut self.pending_request {
-            match pending {
-                PendingRequest::Pull(buf) | PendingRequest::Push(buf) => buf.extend_from_slice(data),
-            }
+        if let Some(buf) = &mut self.pending_request {
+            buf.extend_from_slice(data);
         }
         Ok(())
     }
 
     /// Client closed its write side — process any buffered request payload.
     async fn channel_eof(&mut self, channel: ChannelId, session: &mut Session) -> Result<()> {
-        if let Some(pending) = self.pending_request.take() {
-            let response = match pending {
-                PendingRequest::Pull(buf) => match postcard::from_bytes::<Request>(&buf)? {
-                    Request::Pull { repo_uuid } => handle_pull(repo_uuid)?,
-                    _ => Response::Error("expected pull request".into()),
-                },
-                PendingRequest::Push(buf) => match postcard::from_bytes::<Request>(&buf)? {
-                    Request::Push {
-                        repo_uuid,
-                        repository,
-                        chunks,
-                    } => handle_push(repo_uuid, repository, chunks)?,
-                    _ => Response::Error("expected push request".into()),
-                },
-            };
-            send_response(channel, session, &response)?;
+        if let Some(buf) = self.pending_request.take() {
+            if buf.is_empty() {
+                return Ok(());
+            }
+
+            let command = self.pending_command.take().unwrap_or_default();
+            match postcard::from_bytes::<Request>(&buf)? {
+                Request::Push { repo_uuid } if command == "push" => {
+                    let handle = session.handle();
+                    tokio::spawn(async move {
+                        let response = match handle_push_by_pulling(repo_uuid, handle.clone()).await {
+                            Ok(r) => r,
+                            Err(e) => Response::Error(e.to_string()),
+                        };
+                        let _ = send_response_handle(channel, handle, &response).await;
+                    });
+                }
+                Request::PullSnapshotIds { repo_uuid } if command == "pull" => {
+                    let response = handle_pull_snapshot_ids(repo_uuid)?;
+                    send_response(channel, session, &response)?;
+                }
+                Request::PullObjects {
+                    repo_uuid,
+                    object_ids,
+                } if command == "pull" => {
+                    let response = handle_pull_objects(repo_uuid, &object_ids)?;
+                    send_response(channel, session, &response)?;
+                }
+                _ => {
+                    let response = Response::Error("unexpected request for channel command".into());
+                    send_response(channel, session, &response)?;
+                }
+            }
         }
         Ok(())
     }
@@ -123,6 +140,13 @@ fn send_response(channel: ChannelId, session: &mut Session, response: &Response)
     let bytes = postcard::to_allocvec(response)?;
     session.data(channel, bytes.into());
     session.close(channel);
+    Ok(())
+}
+
+async fn send_response_handle(channel: ChannelId, handle: Handle, response: &Response) -> Result<()> {
+    let bytes = postcard::to_allocvec(response)?;
+    let _ = handle.data(channel, bytes.into()).await;
+    let _ = handle.close(channel).await;
     Ok(())
 }
 
@@ -140,65 +164,88 @@ fn handle_status() -> Result<Response> {
     })
 }
 
-fn handle_pull(repo_uuid: [u8; 32]) -> Result<Response> {
+fn ensure_repo(repo_uuid: [u8; 32]) -> Result<Repository> {
     let repo = load_repository()?;
     if repo.repo_uuid != repo_uuid {
-        return Ok(Response::Error(format!(
+        anyhow::bail!(
             "unknown repo_uuid: requested={}, available={}",
             to_hex(&repo_uuid),
             to_hex(&repo.repo_uuid)
-        )));
+        );
     }
-    let mut chunks = Vec::new();
-    for (id, obj) in &repo.objects {
-        if !matches!(obj, Object::Chunk(_)) {
-            continue;
-        }
-        let data = std::fs::read(format!(".syncup/chunks/{}", to_hex(&id.0)))
-            .with_context(|| format!("missing chunk {}", to_hex(&id.0)))?;
-        chunks.push((*id, data));
-    }
-    Ok(Response::Pull {
-        repository: repo,
-        chunks,
+    Ok(repo)
+}
+
+fn handle_pull_snapshot_ids(repo_uuid: [u8; 32]) -> Result<Response> {
+    let repo = ensure_repo(repo_uuid)?;
+    let snapshot_ids = repo
+        .objects
+        .iter()
+        .filter_map(|(id, obj)| match obj {
+            Object::Snapshot(_) => Some(*id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Response::PullSnapshotIds {
+        head: repo.head,
+        snapshot_ids,
     })
 }
 
-fn handle_push(
-    repo_uuid: [u8; 32],
-    repository: Repository,
-    chunks: Vec<(ObjectId, Vec<u8>)>,
-) -> Result<Response> {
-    if repository.repo_uuid != repo_uuid {
-        return Ok(Response::Error(format!(
-            "push repo_uuid mismatch: request={}, payload={}",
-            to_hex(&repo_uuid),
-            to_hex(&repository.repo_uuid)
-        )));
-    }
+fn handle_pull_objects(repo_uuid: [u8; 32], object_ids: &[ObjectId]) -> Result<Response> {
+    let repo = ensure_repo(repo_uuid)?;
+    let mut objects = Vec::new();
+    let mut chunks = Vec::new();
 
-    let base = std::path::Path::new(".");
-    let current = Repository::load(base);
-    if current.repo_uuid != repo_uuid {
-        return Ok(Response::Error(format!(
-            "unknown repo_uuid: requested={}, available={}",
-            to_hex(&repo_uuid),
-            to_hex(&current.repo_uuid)
-        )));
-    }
-
-    std::fs::create_dir_all(base.join(".syncup/chunks"))?;
-    for (id, data) in &chunks {
-        let path = base.join(format!(".syncup/chunks/{}", to_hex(&id.0)));
-        if !path.exists() {
-            std::fs::write(path, data)?;
+    for id in object_ids {
+        if let Some(obj) = repo.objects.get(id) {
+            objects.push((*id, obj.clone()));
+            if matches!(obj, Object::Chunk(_)) {
+                let data = std::fs::read(format!(".syncup/chunks/{}", to_hex(&id.0)))
+                    .with_context(|| format!("missing chunk {}", to_hex(&id.0)))?;
+                chunks.push((*id, data));
+            }
         }
     }
 
-    let mut local = Repository::load(base);
-    local.merge(repository);
-    local.save(base);
-    Ok(Response::PushOk)
+    Ok(Response::PullObjects { objects, chunks })
+}
+
+async fn rpc_to_connected_client(handle: &Handle, request: Request) -> Result<Response> {
+    let mut channel = handle.channel_open_session().await?;
+
+    let bytes = postcard::to_allocvec(&request)?;
+    channel.data(bytes.as_slice()).await?;
+    channel.eof().await?;
+
+    let mut raw = Vec::new();
+    while let Some(msg) = channel.wait().await {
+        if let russh::ChannelMsg::Data { data } = msg {
+            raw.extend_from_slice(&data);
+        }
+    }
+
+    if raw.is_empty() {
+        anyhow::bail!("empty response from connected client");
+    }
+
+    Ok(postcard::from_bytes(&raw)?)
+}
+
+async fn handle_push_by_pulling(repo_uuid: [u8; 32], handle: Handle) -> Result<Response> {
+    let _local = ensure_repo(repo_uuid)?;
+    let base = std::path::Path::new(".");
+
+    println!("push-triggered pull for repo {}", to_hex(&repo_uuid));
+    crate::pull_and_merge_with(base, |req| {
+        let handle = handle.clone();
+        async move { rpc_to_connected_client(&handle, req).await }
+    })
+    .await?;
+    println!("push-triggered pull complete for repo {}", to_hex(&repo_uuid));
+
+    Ok(Response::PushComplete)
 }
 
 // ── Key loading ───────────────────────────────────────────────────────────────

@@ -1,28 +1,34 @@
-use crate::{ObjectId, Repository};
+use crate::{Object, ObjectId};
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
     Status,
-    Pull {
-        repo_uuid: [u8; 32],
-    },
     Push {
         repo_uuid: [u8; 32],
-        repository: Repository,
-        chunks: Vec<(ObjectId, Vec<u8>)>,
+    },
+    PullSnapshotIds {
+        repo_uuid: [u8; 32],
+    },
+    PullObjects {
+        repo_uuid: [u8; 32],
+        object_ids: Vec<ObjectId>,
     },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum Response {
     Status {
         head: ObjectId,
     },
-    Pull {
-        repository: Repository,
+    PullSnapshotIds {
+        head: ObjectId,
+        snapshot_ids: Vec<ObjectId>,
+    },
+    PullObjects {
+        objects: Vec<(ObjectId, Object)>,
         chunks: Vec<(ObjectId, Vec<u8>)>,
     },
-    PushOk,
+    PushComplete,
     Error(String),
 }
