@@ -1,76 +1,11 @@
+mod common;
+
+use common::{ChildGuard, bin, free_port, run_ok, unique_temp_dir, wait_for_tcp};
 use std::fs;
-use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_syncup")
-}
-
-fn unique_temp_dir(prefix: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before unix epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
-    fs::create_dir_all(&dir).expect("failed to create temporary directory");
-    dir
-}
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind to an ephemeral port");
-    let port = listener
-        .local_addr()
-        .expect("failed to read local addr")
-        .port();
-    drop(listener);
-    port
-}
-
-fn run_ok(mut cmd: Command, what: &str) -> std::process::Output {
-    let output = cmd.output().unwrap_or_else(|e| panic!("failed to run {what}: {e}"));
-    assert!(
-        output.status.success(),
-        "{what} failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
-}
-
-fn wait_for_tcp(addr: (&str, u16), timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if TcpStream::connect(addr).is_ok() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    panic!("server did not start listening on {}:{} within {:?}", addr.0, addr.1, timeout);
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match self.0.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
-                _ => {
-                    let _ = self.0.kill();
-                    let _ = self.0.wait();
-                    break;
-                }
-            }
-        }
-    }
-}
+use std::time::{Duration, Instant};
 
 fn scan_until_found(expected_fullname: &str, expected_port: u16) {
     let deadline = Instant::now() + Duration::from_secs(15);
