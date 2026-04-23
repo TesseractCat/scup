@@ -65,7 +65,7 @@ info!("credentials: {_user}, {_public_key:?}");
         let command = std::str::from_utf8(data)?;
         debug!("exec request on channel {:?}: {}", channel, command);
         match command {
-            "status" => send_response(channel, session, &handle_status()?)?,
+            "status" => send_response(channel, session.handle(), &handle_status()?).await?,
             "pull" | "push" => {
                 self.pending_command = Some(command.to_string());
                 self.pending_request = Some(Vec::new());
@@ -76,9 +76,9 @@ info!("credentials: {_user}, {_public_key:?}");
             cmd => {
                 send_response(
                     channel,
-                    session,
+                    session.handle(),
                     &Response::Error(format!("unknown command: {cmd}")),
-                )?;
+                ).await?;
             }
         }
         Ok(())
@@ -98,7 +98,7 @@ info!("credentials: {_user}, {_public_key:?}");
         Ok(())
     }
 
-    /// Client closed its write side — process any buffered request payload.
+    /// Client closed its write side - process any buffered request payload.
     async fn channel_eof(&mut self, channel: ChannelId, session: &mut Session) -> Result<()> {
         if let Some(buf) = self.pending_request.take() {
             if buf.is_empty() {
@@ -112,7 +112,7 @@ info!("credentials: {_user}, {_public_key:?}");
                 command,
                 buf.len()
             );
-            match postcard::from_bytes::<Request>(&buf)? {
+            match crate::protocol::decode_request(&buf)? {
                 Request::Push { repo_uuid } if command == "push" => {
                     let handle = session.handle();
                     tokio::spawn(async move {
@@ -120,23 +120,32 @@ info!("credentials: {_user}, {_public_key:?}");
                             Ok(r) => r,
                             Err(e) => Response::Error(e.to_string()),
                         };
-                        let _ = send_response_handle(channel, handle, &response).await;
+                        let _ = send_response(channel, handle, &response).await;
                     });
                 }
                 Request::PullSnapshotIds { repo_uuid } if command == "pull" => {
                     let response = handle_pull_snapshot_ids(repo_uuid)?;
-                    send_response(channel, session, &response)?;
+                    let handle = session.handle();
+                    tokio::spawn(async move {
+                        let _ = send_response(channel, handle, &response).await;
+                    });
                 }
                 Request::PullObjects {
                     repo_uuid,
                     object_ids,
                 } if command == "pull" => {
                     let response = handle_pull_objects(repo_uuid, &object_ids)?;
-                    send_response(channel, session, &response)?;
+                    let handle = session.handle();
+                    tokio::spawn(async move {
+                        let _ = send_response(channel, handle, &response).await;
+                    });
                 }
                 _ => {
                     let response = Response::Error("unexpected request for channel command".into());
-                    send_response(channel, session, &response)?;
+                    let handle = session.handle();
+                    tokio::spawn(async move {
+                        let _ = send_response(channel, handle, &response).await;
+                    });
                 }
             }
         }
@@ -146,16 +155,11 @@ info!("credentials: {_user}, {_public_key:?}");
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn send_response(channel: ChannelId, session: &mut Session, response: &Response) -> Result<()> {
-    let bytes = postcard::to_allocvec(response)?;
-    session.data(channel, bytes.into());
-    session.close(channel);
-    Ok(())
-}
-
-async fn send_response_handle(channel: ChannelId, handle: Handle, response: &Response) -> Result<()> {
-    let bytes = postcard::to_allocvec(response)?;
-    let _ = handle.data(channel, bytes.into()).await;
+async fn send_response(channel: ChannelId, handle: Handle, response: &Response) -> Result<()> {
+    let bytes = crate::protocol::encode_response(response)?;
+    for chunk in bytes.chunks(32 * 1024) {
+        let _ = handle.data(channel, chunk.to_vec().into()).await;
+    }
     let _ = handle.close(channel).await;
     Ok(())
 }
@@ -238,29 +242,6 @@ fn handle_pull_objects(repo_uuid: [u8; 32], object_ids: &[ObjectId]) -> Result<R
     Ok(Response::PullObjects { objects, chunks })
 }
 
-async fn rpc_to_connected_client(handle: &Handle, request: Request) -> Result<Response> {
-    debug!("rpc to connected client: {:?}", request);
-    let mut channel = handle.channel_open_session().await?;
-
-    let bytes = postcard::to_allocvec(&request)?;
-    channel.data(bytes.as_slice()).await?;
-    channel.eof().await?;
-
-    let mut raw = Vec::new();
-    while let Some(msg) = channel.wait().await {
-        if let russh::ChannelMsg::Data { data } = msg {
-            raw.extend_from_slice(&data);
-        }
-    }
-
-    if raw.is_empty() {
-        anyhow::bail!("empty response from connected client");
-    }
-
-    debug!("rpc from connected client returned {} bytes", raw.len());
-    Ok(postcard::from_bytes(&raw)?)
-}
-
 async fn handle_push_by_pulling(repo_uuid: [u8; 32], handle: Handle) -> Result<Response> {
     let _local = ensure_repo(repo_uuid)?;
     let base = std::path::Path::new(".");
@@ -268,7 +249,7 @@ async fn handle_push_by_pulling(repo_uuid: [u8; 32], handle: Handle) -> Result<R
     info!("push-triggered pull for repo {}", to_hex(&repo_uuid));
     crate::pull_and_merge_with(base, |req| {
         let handle = handle.clone();
-        async move { rpc_to_connected_client(&handle, req).await }
+        async move { crate::rpc(&handle, req).await }
     })
     .await?;
     info!("push-triggered pull complete for repo {}", to_hex(&repo_uuid));
@@ -298,7 +279,11 @@ fn load_host_key() -> Result<KeyPair> {
 
 const MDNS_SERVICE_TYPE: &str = "_syncup._tcp.local.";
 
-fn advertise_mdns(port: u16, repo_uuids: &[[u8; 32]]) -> Result<ServiceDaemon> {
+fn advertise_mdns(
+    port: u16,
+    repo_uuids: &[[u8; 32]],
+    repo_roots: &[String],
+) -> Result<ServiceDaemon> {
     let mdns = ServiceDaemon::new().context("failed to start mDNS daemon")?;
 
     let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "syncup".to_string());
@@ -312,6 +297,7 @@ fn advertise_mdns(port: u16, repo_uuids: &[[u8; 32]]) -> Result<ServiceDaemon> {
         .collect::<Vec<_>>()
         .join(",");
     properties.insert("repos".to_string(), repo_list);
+    properties.insert("roots".to_string(), repo_roots.join(","));
 
     let service = ServiceInfo::new(
         MDNS_SERVICE_TYPE,
@@ -327,11 +313,21 @@ fn advertise_mdns(port: u16, repo_uuids: &[[u8; 32]]) -> Result<ServiceDaemon> {
     mdns.register(service)
         .context("failed to register mDNS service")?;
 
-    info!("mDNS advertised: {instance_name}.{MDNS_SERVICE_TYPE} -> {host_name}:{port}");
+    info!(
+        "mDNS advertised: {instance_name}.{MDNS_SERVICE_TYPE} -> {host_name}:{port} repos={} roots={}",
+        repo_uuids.len(),
+        repo_roots.join(",")
+    );
     Ok(mdns)
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
+
+fn current_repo_root_name() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+}
 
 pub async fn serve(port: u16) -> Result<()> {
     let config = Arc::new(russh::server::Config {
@@ -344,8 +340,13 @@ pub async fn serve(port: u16) -> Result<()> {
     let repo_uuids = load_repository()
         .map(|r| vec![r.repo_uuid])
         .unwrap_or_else(|_| Vec::new());
+    let repo_roots = if repo_uuids.is_empty() {
+        Vec::new()
+    } else {
+        vec![current_repo_root_name().unwrap_or_else(|| "<unknown>".to_string())]
+    };
 
-    let _mdns = advertise_mdns(port, &repo_uuids)?;
+    let _mdns = advertise_mdns(port, &repo_uuids, &repo_roots)?;
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     info!("Listening on 0.0.0.0:{port}");

@@ -4,8 +4,15 @@ use std::path::{Path, PathBuf};
 mod cli;
 use cli::cli;
 
-fn init_logger(verbose: bool) {
-    let default_level = if verbose { "debug" } else { "info" };
+fn init_logger(verbosity: u8) {
+    let default_level = if verbosity >= 2 {
+        "debug"
+    } else if verbosity >= 1 {
+        "info,syncup=debug"
+    } else {
+        "info"
+    };
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
         .target(env_logger::Target::Stdout)
         .init();
@@ -13,7 +20,9 @@ fn init_logger(verbose: bool) {
 
 fn main() -> anyhow::Result<()> {
     let matches = cli().get_matches();
-    init_logger(matches.get_flag("verbose"));
+    init_logger(
+        matches.get_count("verbose"),
+    );
 
     match matches.subcommand() {
         Some(("init", _)) => {
@@ -55,6 +64,15 @@ fn main() -> anyhow::Result<()> {
         }
         Some(("pull", _)) => {
             tokio::runtime::Runtime::new()?.block_on(syncup::pull_all(Path::new(".")))?;
+        }
+        Some(("clone", sub)) => {
+            let host_id = sub
+                .get_one::<String>("HOST")
+                .expect("HOST is required by clap");
+            let repo = sub
+                .get_one::<String>("REPO")
+                .expect("REPO is required by clap");
+            tokio::runtime::Runtime::new()?.block_on(syncup::clone_from(host_id, repo))?;
         }
         Some(("serve", sub)) => {
             let port = *sub

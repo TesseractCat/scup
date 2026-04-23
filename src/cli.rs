@@ -9,9 +9,9 @@ pub fn cli() -> Command {
         .arg_required_else_help(true)
         .allow_external_subcommands(true)
         .arg(
-            arg!(-v --verbose "Enable verbose logging (debug level)")
+            arg!(-v --verbose "Enable verbose logging for syncup (use -vv for all logs)")
                 .global(true)
-                .action(ArgAction::SetTrue),
+                .action(ArgAction::Count),
         )
         .subcommand(Command::new("init").about("Initialize repository"))
         .subcommand(
@@ -41,6 +41,12 @@ pub fn cli() -> Command {
         )
         .subcommand(Command::new("push").about("Scan and push this repository to matching hosts"))
         .subcommand(Command::new("pull").about("Scan and pull this repository from matching hosts"))
+        .subcommand(
+            Command::new("clone")
+                .about("Clone a repository from a scanned host")
+                .arg(arg!(<HOST> "Host id as printed by `scan`"))
+                .arg(arg!(<REPO> "Repo root name or repo id")),
+        )
         .subcommand(
             Command::new("scan")
                 .about("Scan for sync servers on the local network via mDNS")

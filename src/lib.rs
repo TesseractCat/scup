@@ -539,10 +539,12 @@ impl russh::client::Handler for DebugStatusClient {
             return Ok(());
         };
 
-        let req: protocol::Request = postcard::from_bytes(&buf)?;
+        let req = protocol::decode_request(&buf)?;
         let response = pull::local_pull_response(&self.base, req);
-        let bytes = postcard::to_allocvec(&response)?;
-        let _ = session.data(channel, bytes.into());
+        let bytes = protocol::encode_response(&response)?;
+        for chunk in bytes.chunks(32 * 1024) {
+            let _ = session.data(channel, chunk.to_vec().into());
+        }
         let _ = session.close(channel);
         Ok(())
     }
@@ -581,7 +583,7 @@ pub(crate) async fn connect_and_auth(
     Ok(session)
 }
 
-pub(crate) async fn rpc(
+pub(crate) async fn rpc_to_host(
     host: &scan::ScannedHost,
     command: &str,
     request: Option<&protocol::Request>,
@@ -593,7 +595,7 @@ pub(crate) async fn rpc(
     channel.exec(false, command).await?;
 
     if let Some(req) = request {
-        let bytes = postcard::to_allocvec(req)?;
+        let bytes = protocol::encode_request(req)?;
         channel.data(bytes.as_slice()).await?;
         channel.eof().await?;
     }
@@ -614,13 +616,37 @@ pub(crate) async fn rpc(
         anyhow::bail!("empty response from host");
     }
 
-    Ok(postcard::from_bytes(&raw)?)
+    Ok(protocol::decode_response(&raw)?)
+}
+
+pub(crate) async fn rpc(
+    handle: &russh::server::Handle,
+    request: protocol::Request,
+) -> anyhow::Result<protocol::Response> {
+    let mut channel = handle.channel_open_session().await?;
+
+    let bytes = protocol::encode_request(&request)?;
+    channel.data(bytes.as_slice()).await?;
+    channel.eof().await?;
+
+    let mut raw = Vec::new();
+    while let Some(msg) = channel.wait().await {
+        if let russh::ChannelMsg::Data { data } = msg {
+            raw.extend_from_slice(&data);
+        }
+    }
+
+    if raw.is_empty() {
+        anyhow::bail!("empty response from connected client");
+    }
+
+    Ok(protocol::decode_response(&raw)?)
 }
 
 pub async fn debug_status(host_id: &str) -> anyhow::Result<()> {
     let host = scan::resolve_host(host_id, 3)?;
 
-    let response = rpc(&host, "status", None, Path::new(".")).await?;
+    let response = rpc_to_host(&host, "status", None, Path::new(".")).await?;
     match response {
         protocol::Response::Status { head } => {
             info!("- {} status: head={}", host.fullname, to_hex(&head.0));
@@ -641,11 +667,11 @@ pub async fn push_all(base: &Path) -> anyhow::Result<()> {
     let hosts = scan::scan_hosts(3)?;
 
     for host in hosts {
-        if !host.repo_uuids.iter().any(|id| id == &local.repo_uuid) {
+        if !host.repos.iter().any(|repo| repo.repo_uuid == local.repo_uuid) {
             continue;
         }
 
-        let response = rpc(
+        let response = rpc_to_host(
             &host,
             "push",
             Some(&protocol::Request::Push {
@@ -676,6 +702,11 @@ pub fn scan(timeout_secs: u64) -> anyhow::Result<()> {
 
 pub async fn serve_on(port: u16) -> anyhow::Result<()> {
     serve::serve(port).await
+}
+
+pub async fn clone_from(host_id: &str, repo_selector: &str) -> anyhow::Result<()> {
+    let host = scan::resolve_host(host_id, 3)?;
+    pull::clone_from_resolved_host(Path::new("."), &host, repo_selector).await
 }
 
 pub fn debug_chunk_file(path: &Path) {

@@ -5,6 +5,8 @@ use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
+use crate::to_hex;
+
 const MDNS_SERVICE_TYPE: &str = "_syncup._tcp.local.";
 
 fn parse_repo_list(value: Option<&str>) -> Vec<[u8; 32]> {
@@ -29,12 +31,42 @@ fn parse_repo_list(value: Option<&str>) -> Vec<[u8; 32]> {
         .collect()
 }
 
+fn parse_string_list(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+pub struct ScannedRepo {
+    pub repo_uuid: [u8; 32],
+    pub root: String,
+}
+
+fn combine_repos(repo_uuids: Vec<[u8; 32]>, repo_roots: Vec<String>) -> Vec<ScannedRepo> {
+    repo_uuids
+        .into_iter()
+        .enumerate()
+        .map(|(i, repo_uuid)| ScannedRepo {
+            repo_uuid,
+            root: repo_roots
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| "<unknown>".to_string()),
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct ScannedHost {
     pub fullname: String,
     pub addrs: Vec<IpAddr>,
     pub port: u16,
-    pub repo_uuids: Vec<[u8; 32]>,
+    pub repos: Vec<ScannedRepo>,
 }
 
 pub fn scan_hosts(timeout_secs: u64) -> Result<Vec<ScannedHost>> {
@@ -68,17 +100,22 @@ pub fn scan_hosts(timeout_secs: u64) -> Result<Vec<ScannedHost>> {
                     .collect();
                 addrs.sort();
 
+                let repos = combine_repos(
+                    parse_repo_list(info.get_property_val_str("repos")),
+                    parse_string_list(info.get_property_val_str("roots")),
+                );
+
                 let host = ScannedHost {
                     fullname,
                     addrs,
                     port: info.get_port(),
-                    repo_uuids: parse_repo_list(info.get_property_val_str("repos")),
+                    repos,
                 };
                 debug!(
                     "resolved host {}:{} repos={}",
                     host.fullname,
                     host.port,
-                    host.repo_uuids.len()
+                    host.repos.len(),
                 );
                 hosts.push(host);
             }
@@ -104,12 +141,12 @@ pub fn scan(timeout_secs: u64) -> Result<()> {
             addrs.join(",")
         };
 
-        let repos = if host.repo_uuids.is_empty() {
+        let repos = if host.repos.is_empty() {
             "<none>".to_string()
         } else {
-            host.repo_uuids
+            host.repos
                 .iter()
-                .map(|id| id.iter().map(|b| format!("{b:02x}")).collect::<String>())
+                .map(|repo| format!("{}:{}", to_hex(&repo.repo_uuid), repo.root))
                 .collect::<Vec<_>>()
                 .join(",")
         };
@@ -155,11 +192,16 @@ pub fn resolve_host(host_id: &str, timeout_secs: u64) -> Result<ScannedHost> {
                     .collect();
                 addrs.sort();
 
+                let repos = combine_repos(
+                    parse_repo_list(info.get_property_val_str("repos")),
+                    parse_string_list(info.get_property_val_str("roots")),
+                );
+
                 let host = ScannedHost {
                     fullname,
                     addrs,
                     port: info.get_port(),
-                    repo_uuids: parse_repo_list(info.get_property_val_str("repos")),
+                    repos,
                 };
 
                 let _ = mdns.stop_browse(MDNS_SERVICE_TYPE);
