@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use async_trait::async_trait;
+use log::{debug, error, info, warn};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use russh::ChannelId;
 use russh::server::{Auth, Handle, Handler, Server, Session};
@@ -39,7 +40,7 @@ impl Handler for ConnectionHandler {
         _user: &str,
         _public_key: &russh_keys::key::PublicKey,
     ) -> Result<Auth> {
-        println!("credentials: {_user}, {_public_key:?}");
+info!("credentials: {_user}, {_public_key:?}");
         // Accept any key that completes the SSH handshake.
         // Add authorized-keys enforcement here when needed.
         Ok(Auth::Accept)
@@ -61,10 +62,12 @@ impl Handler for ConnectionHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<()> {
-        match std::str::from_utf8(data)? {
+        let command = std::str::from_utf8(data)?;
+        debug!("exec request on channel {:?}: {}", channel, command);
+        match command {
             "status" => send_response(channel, session, &handle_status()?)?,
             "pull" | "push" => {
-                self.pending_command = Some(std::str::from_utf8(data)?.to_string());
+                self.pending_command = Some(command.to_string());
                 self.pending_request = Some(Vec::new());
                 if data.is_empty() {
                     return Ok(());
@@ -90,6 +93,7 @@ impl Handler for ConnectionHandler {
     ) -> Result<()> {
         if let Some(buf) = &mut self.pending_request {
             buf.extend_from_slice(data);
+            debug!("buffered {} bytes of request payload", data.len());
         }
         Ok(())
     }
@@ -102,6 +106,12 @@ impl Handler for ConnectionHandler {
             }
 
             let command = self.pending_command.take().unwrap_or_default();
+            debug!(
+                "channel eof on {:?}: command={}, payload_bytes={}",
+                channel,
+                command,
+                buf.len()
+            );
             match postcard::from_bytes::<Request>(&buf)? {
                 Request::Push { repo_uuid } if command == "push" => {
                     let handle = session.handle();
@@ -177,6 +187,7 @@ fn ensure_repo(repo_uuid: [u8; 32]) -> Result<Repository> {
 }
 
 fn handle_pull_snapshot_ids(repo_uuid: [u8; 32]) -> Result<Response> {
+    debug!("serve: pull snapshot ids for repo {}", to_hex(&repo_uuid));
     let repo = ensure_repo(repo_uuid)?;
     let snapshot_ids = repo
         .objects
@@ -187,6 +198,11 @@ fn handle_pull_snapshot_ids(repo_uuid: [u8; 32]) -> Result<Response> {
         })
         .collect::<Vec<_>>();
 
+    debug!(
+        "serve: snapshot ids response head={}, count={}",
+        to_hex(&repo.head.0),
+        snapshot_ids.len()
+    );
     Ok(Response::PullSnapshotIds {
         head: repo.head,
         snapshot_ids,
@@ -194,6 +210,11 @@ fn handle_pull_snapshot_ids(repo_uuid: [u8; 32]) -> Result<Response> {
 }
 
 fn handle_pull_objects(repo_uuid: [u8; 32], object_ids: &[ObjectId]) -> Result<Response> {
+    debug!(
+        "serve: pull objects for repo {}, requested={}",
+        to_hex(&repo_uuid),
+        object_ids.len()
+    );
     let repo = ensure_repo(repo_uuid)?;
     let mut objects = Vec::new();
     let mut chunks = Vec::new();
@@ -209,10 +230,16 @@ fn handle_pull_objects(repo_uuid: [u8; 32], object_ids: &[ObjectId]) -> Result<R
         }
     }
 
+    debug!(
+        "serve: pull objects response objects={}, chunks={}",
+        objects.len(),
+        chunks.len()
+    );
     Ok(Response::PullObjects { objects, chunks })
 }
 
 async fn rpc_to_connected_client(handle: &Handle, request: Request) -> Result<Response> {
+    debug!("rpc to connected client: {:?}", request);
     let mut channel = handle.channel_open_session().await?;
 
     let bytes = postcard::to_allocvec(&request)?;
@@ -230,6 +257,7 @@ async fn rpc_to_connected_client(handle: &Handle, request: Request) -> Result<Re
         anyhow::bail!("empty response from connected client");
     }
 
+    debug!("rpc from connected client returned {} bytes", raw.len());
     Ok(postcard::from_bytes(&raw)?)
 }
 
@@ -237,13 +265,13 @@ async fn handle_push_by_pulling(repo_uuid: [u8; 32], handle: Handle) -> Result<R
     let _local = ensure_repo(repo_uuid)?;
     let base = std::path::Path::new(".");
 
-    println!("push-triggered pull for repo {}", to_hex(&repo_uuid));
+    info!("push-triggered pull for repo {}", to_hex(&repo_uuid));
     crate::pull_and_merge_with(base, |req| {
         let handle = handle.clone();
         async move { rpc_to_connected_client(&handle, req).await }
     })
     .await?;
-    println!("push-triggered pull complete for repo {}", to_hex(&repo_uuid));
+    info!("push-triggered pull complete for repo {}", to_hex(&repo_uuid));
 
     Ok(Response::PushComplete)
 }
@@ -260,8 +288,8 @@ fn load_host_key() -> Result<KeyPair> {
     }
 
     // russh-keys has no key-write API, so generate an ephemeral key and warn.
-    eprintln!(
-        "warning: ~/.ssh/id_ed25519 not found; using an ephemeral host key (fingerprint changes on restart)"
+    warn!(
+        "~/.ssh/id_ed25519 not found; using an ephemeral host key (fingerprint changes on restart)"
     );
     KeyPair::generate_ed25519().context("key generation failed")
 }
@@ -299,7 +327,7 @@ fn advertise_mdns(port: u16, repo_uuids: &[[u8; 32]]) -> Result<ServiceDaemon> {
     mdns.register(service)
         .context("failed to register mDNS service")?;
 
-    println!("mDNS advertised: {instance_name}.{MDNS_SERVICE_TYPE} -> {host_name}:{port}");
+    info!("mDNS advertised: {instance_name}.{MDNS_SERVICE_TYPE} -> {host_name}:{port}");
     Ok(mdns)
 }
 
@@ -320,23 +348,24 @@ pub async fn serve(port: u16) -> Result<()> {
     let _mdns = advertise_mdns(port, &repo_uuids)?;
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
-    println!("Listening on 0.0.0.0:{port}");
+    info!("Listening on 0.0.0.0:{port}");
 
     let mut server = SyncupServer;
     loop {
         let (stream, addr) = listener.accept().await?;
+        debug!("accepted TCP connection from {addr}");
         let config = config.clone();
         let handler = server.new_client(Some(addr));
         tokio::spawn(async move {
             let session = match russh::server::run_stream(config, stream, handler).await {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("Handshake error [{addr}]: {e:#}");
+                    error!("Handshake error [{addr}]: {e:#}");
                     return;
                 }
             };
             if let Err(e) = session.await {
-                eprintln!("Session error [{addr}]: {e:#}");
+                error!("Session error [{addr}]: {e:#}");
             }
         });
     }

@@ -1,10 +1,19 @@
+use log::info;
 use std::path::{Path, PathBuf};
 
 mod cli;
 use cli::cli;
 
+fn init_logger(verbose: bool) {
+    let default_level = if verbose { "debug" } else { "info" };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
+        .target(env_logger::Target::Stdout)
+        .init();
+}
+
 fn main() -> anyhow::Result<()> {
     let matches = cli().get_matches();
+    init_logger(matches.get_flag("verbose"));
 
     match matches.subcommand() {
         Some(("init", _)) => {
@@ -25,7 +34,7 @@ fn main() -> anyhow::Result<()> {
             }
             Some(("print-repo", _)) => {
                 let repo: syncup::Repository = syncup::Repository::load(Path::new("."));
-                println!("{:#?}", repo);
+                info!("{:#?}", repo);
             }
             Some(("status", sub)) => {
                 let host_id = sub

@@ -1,5 +1,6 @@
 use ignore::Walk;
 use kdam::tqdm;
+use log::info;
 use postcard;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -338,7 +339,7 @@ impl Repository {
             head: ObjectId([0u8; 32]),
         };
         repo.snapshot(base, Some("Initial snapshot".to_string()));
-        println!("Repository UUID: {}", to_hex(&repo.repo_uuid));
+        info!("Repository UUID: {}", to_hex(&repo.repo_uuid));
         repo
     }
 
@@ -447,7 +448,7 @@ impl Repository {
         self.objects.insert(sid, Object::Snapshot(snap));
         self.head = sid;
 
-        println!("Snapshot: {}", to_hex(&sid.0));
+        info!("Snapshot: {}", to_hex(&sid.0));
         self.save(base);
     }
 
@@ -622,13 +623,13 @@ pub async fn debug_status(host_id: &str) -> anyhow::Result<()> {
     let response = rpc(&host, "status", None, Path::new(".")).await?;
     match response {
         protocol::Response::Status { head } => {
-            println!("- {} status: head={}", host.fullname, to_hex(&head.0));
+            info!("- {} status: head={}", host.fullname, to_hex(&head.0));
         }
         protocol::Response::Error(err) => {
-            println!("- {} error: {}", host.fullname, err);
+            info!("- {} error: {}", host.fullname, err);
         }
         _ => {
-            println!("- {} returned an unexpected response", host.fullname);
+            info!("- {} returned an unexpected response", host.fullname);
         }
     }
 
@@ -656,13 +657,13 @@ pub async fn push_all(base: &Path) -> anyhow::Result<()> {
 
         match response {
             Ok(protocol::Response::PushComplete) => {
-                println!("- pushed to {}", host.fullname)
+                info!("- pushed to {}", host.fullname)
             }
             Ok(protocol::Response::Error(err)) => {
-                println!("- push to {} failed: {}", host.fullname, err)
+                info!("- push to {} failed: {}", host.fullname, err)
             }
-            Ok(_) => println!("- {} returned unexpected response to push", host.fullname),
-            Err(err) => println!("- push to {} failed: {}", host.fullname, err),
+            Ok(_) => info!("- {} returned unexpected response to push", host.fullname),
+            Err(err) => info!("- push to {} failed: {}", host.fullname, err),
         }
     }
 

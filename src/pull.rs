@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::{Object, ObjectId, Repository, protocol, scan, to_hex};
+use log::{debug, info};
 
 pub(crate) fn object_refs(obj: &Object) -> Vec<ObjectId> {
     match obj {
@@ -21,6 +22,7 @@ pub(crate) fn object_refs(obj: &Object) -> Vec<ObjectId> {
 }
 
 pub(crate) fn local_pull_response(base: &Path, req: protocol::Request) -> protocol::Response {
+    debug!("handling local pull request from {:?}: {:?}", base, req);
     let repo = Repository::load(base);
     let repo_uuid = repo.repo_uuid;
 
@@ -47,6 +49,11 @@ pub(crate) fn local_pull_response(base: &Path, req: protocol::Request) -> protoc
                         _ => None,
                     })
                     .collect::<Vec<_>>();
+                debug!(
+                    "local pull snapshot ids: head={}, count={}",
+                    to_hex(&repo.head.0),
+                    snapshot_ids.len()
+                );
                 protocol::Response::PullSnapshotIds {
                     head: repo.head,
                     snapshot_ids,
@@ -59,6 +66,7 @@ pub(crate) fn local_pull_response(base: &Path, req: protocol::Request) -> protoc
             object_ids,
         } => match ensure(repo_uuid) {
             Ok(repo) => {
+                debug!("local pull objects requested: {} ids", object_ids.len());
                 let mut objects = Vec::new();
                 let mut chunks = Vec::new();
                 for id in object_ids {
@@ -72,6 +80,11 @@ pub(crate) fn local_pull_response(base: &Path, req: protocol::Request) -> protoc
                         }
                     }
                 }
+                debug!(
+                    "local pull objects response: objects={}, chunks={}",
+                    objects.len(),
+                    chunks.len()
+                );
                 protocol::Response::PullObjects { objects, chunks }
             }
             Err(err) => protocol::Response::Error(err),
@@ -84,6 +97,7 @@ pub(crate) async fn pull_and_merge_from_host(
     base: &Path,
     host: &scan::ScannedHost,
 ) -> anyhow::Result<()> {
+    debug!("pulling and merging from host {}", host.fullname);
     pull_and_merge_with(base, |req| async move { crate::rpc(host, "pull", Some(&req), base).await })
         .await
 }
@@ -98,6 +112,11 @@ where
 {
     let local = Repository::load(base);
     let local_object_ids: BTreeSet<ObjectId> = local.objects.keys().copied().collect();
+    debug!(
+        "starting pull-and-merge: local_head={}, local_objects={}",
+        to_hex(&local.head.0),
+        local_object_ids.len()
+    );
 
     let response = send(protocol::Request::PullSnapshotIds {
         repo_uuid: local.repo_uuid,
@@ -110,6 +129,12 @@ where
         _ => anyhow::bail!("unexpected response to PullSnapshotIds"),
     };
 
+    debug!(
+        "received snapshot ids: remote_head={}, snapshot_count={}",
+        to_hex(&remote_head.0),
+        snapshot_ids.len()
+    );
+
     let mut need: BTreeSet<ObjectId> = snapshot_ids
         .into_iter()
         .filter(|id| !local_object_ids.contains(id))
@@ -120,6 +145,7 @@ where
 
     while !need.is_empty() {
         let req_ids: Vec<ObjectId> = need.iter().copied().collect();
+        debug!("requesting {} objects", req_ids.len());
         need.clear();
 
         let response = send(protocol::Request::PullObjects {
@@ -133,6 +159,12 @@ where
             protocol::Response::Error(err) => anyhow::bail!("object pull failed: {err}"),
             _ => anyhow::bail!("unexpected response to PullObjects"),
         };
+
+        debug!(
+            "received object batch: objects={}, chunks={}",
+            objects.len(),
+            chunks.len()
+        );
 
         for (id, data) in chunks {
             fetched_chunks.entry(id).or_insert(data);
@@ -151,6 +183,12 @@ where
         }
     }
 
+    debug!(
+        "finished pull graph walk: fetched_objects={}, fetched_chunks={}",
+        fetched_objects.len(),
+        fetched_chunks.len()
+    );
+
     std::fs::create_dir_all(base.join(".syncup/chunks")).expect("failed to create .syncup/chunks");
     for (id, data) in fetched_chunks {
         let path = base.join(format!(".syncup/chunks/{}", to_hex(&id.0)));
@@ -168,6 +206,7 @@ where
     let mut merged = Repository::load(base);
     merged.merge(remote_repo.clone());
     merged.save(base);
+    debug!("merge complete, repository saved");
 
     Ok(())
 }
@@ -182,8 +221,8 @@ pub async fn pull_all(base: &Path) -> anyhow::Result<()> {
         }
 
         match pull_and_merge_from_host(base, &host).await {
-            Ok(()) => println!("- pulled from {}", host.fullname),
-            Err(err) => println!("- pull from {} failed: {}", host.fullname, err),
+            Ok(()) => info!("- pulled from {}", host.fullname),
+            Err(err) => info!("- pull from {} failed: {}", host.fullname, err),
         }
     }
 

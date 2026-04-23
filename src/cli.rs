@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Command, arg, value_parser};
+use clap::{ArgAction, Command, arg, value_parser};
 
 pub fn cli() -> Command {
     Command::new("syncup")
@@ -8,6 +8,11 @@ pub fn cli() -> Command {
         .subcommand_required(true)
         .arg_required_else_help(true)
         .allow_external_subcommands(true)
+        .arg(
+            arg!(-v --verbose "Enable verbose logging (debug level)")
+                .global(true)
+                .action(ArgAction::SetTrue),
+        )
         .subcommand(Command::new("init").about("Initialize repository"))
         .subcommand(
             Command::new("debug")

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use log::{debug, info};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use std::collections::BTreeSet;
 use std::net::IpAddr;
@@ -67,12 +68,19 @@ pub fn scan_hosts(timeout_secs: u64) -> Result<Vec<ScannedHost>> {
                     .collect();
                 addrs.sort();
 
-                hosts.push(ScannedHost {
+                let host = ScannedHost {
                     fullname,
                     addrs,
                     port: info.get_port(),
                     repo_uuids: parse_repo_list(info.get_property_val_str("repos")),
-                });
+                };
+                debug!(
+                    "resolved host {}:{} repos={}",
+                    host.fullname,
+                    host.port,
+                    host.repo_uuids.len()
+                );
+                hosts.push(host);
             }
         }
     }
@@ -84,7 +92,7 @@ pub fn scan_hosts(timeout_secs: u64) -> Result<Vec<ScannedHost>> {
 }
 
 pub fn scan(timeout_secs: u64) -> Result<()> {
-    println!("Browsing for {MDNS_SERVICE_TYPE} for {timeout_secs}s...");
+    info!("Browsing for {MDNS_SERVICE_TYPE} for {timeout_secs}s...");
     let hosts = scan_hosts(timeout_secs)?;
 
     for host in &hosts {
@@ -106,13 +114,13 @@ pub fn scan(timeout_secs: u64) -> Result<()> {
                 .join(",")
         };
 
-        println!("- {} at {addrs}:{} repos={repos}", host.fullname, host.port);
+        info!("- {} at {addrs}:{} repos={repos}", host.fullname, host.port);
     }
 
     if hosts.is_empty() {
-        println!("No syncup servers found.");
+        info!("No syncup servers found.");
     } else {
-        println!("Found {} server(s).", hosts.len());
+        info!("Found {} server(s).", hosts.len());
     }
 
     Ok(())
