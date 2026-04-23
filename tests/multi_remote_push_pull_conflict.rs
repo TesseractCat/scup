@@ -200,6 +200,14 @@ fn push_pull_multiple_remotes_then_conflict() {
     let r2_tree = head_tree(&r2_repo);
     assert!(r1_tree.entries.keys().any(|p| p.ends_with("from_local.txt") || p == "from_local.txt" || p == "./from_local.txt"));
     assert!(r2_tree.entries.keys().any(|p| p.ends_with("from_local.txt") || p == "from_local.txt" || p == "./from_local.txt"));
+    assert_eq!(
+        fs::read(remote1.join("from_local.txt")).expect("remote1 missing from_local.txt"),
+        b"hello from local\n"
+    );
+    assert_eq!(
+        fs::read(remote2.join("from_local.txt")).expect("remote2 missing from_local.txt"),
+        b"hello from local\n"
+    );
 
     // 2) Standard pull from one remote (still through multi-remote pull command).
     fs::write(remote1.join("from_remote1.txt"), b"hello from remote1\n")
@@ -233,6 +241,10 @@ fn push_pull_multiple_remotes_then_conflict() {
             .keys()
             .any(|p| p.ends_with("from_remote1.txt") || p == "from_remote1.txt" || p == "./from_remote1.txt"),
         "local repo missing file from remote1 after pull"
+    );
+    assert_eq!(
+        fs::read(local.join("from_remote1.txt")).expect("local missing from_remote1.txt after pull"),
+        b"hello from remote1\n"
     );
 
     // 3) Conflict: remote1 older, remote2 newer; pull should keep newer mtime content.
@@ -276,6 +288,10 @@ fn push_pull_multiple_remotes_then_conflict() {
     let local_repo_final = read_repo(&local);
     let conflict_content = file_content_from_repo(&local, &local_repo_final, "conflict.txt");
     assert_eq!(conflict_content, b"newer\n");
+    assert_eq!(
+        fs::read(local.join("conflict.txt")).expect("local missing conflict.txt"),
+        b"newer\n"
+    );
 
     drop(server1);
     drop(server2);

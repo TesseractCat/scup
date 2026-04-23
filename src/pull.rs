@@ -98,6 +98,7 @@ pub(crate) fn local_pull_response(base: &Path, req: protocol::Request) -> protoc
 async fn fetch_remote_objects<F, Fut>(
     repo_uuid: [u8; 32],
     local_object_ids: &BTreeSet<ObjectId>,
+    total_objects_hint: Option<usize>,
     mut send: F,
 ) -> anyhow::Result<(ObjectId, BTreeMap<ObjectId, Object>, BTreeMap<ObjectId, Vec<u8>>)>
 where
@@ -124,7 +125,10 @@ where
         .collect();
 
     let mut pulled_count = 0usize;
-    let mut pull_bar = Bar::new(need.len().max(1));
+    let hinted_missing = total_objects_hint
+        .map(|total| total.saturating_sub(local_object_ids.len()))
+        .unwrap_or(0);
+    let mut pull_bar = Bar::new(need.len().max(hinted_missing).max(1));
     pull_bar.set_description("Pulling objects");
 
     let mut fetched_objects: BTreeMap<ObjectId, Object> = BTreeMap::new();
@@ -199,7 +203,12 @@ pub(crate) async fn pull_and_merge_from_host(
     host: &scan::ScannedHost,
 ) -> anyhow::Result<()> {
     debug!("pulling and merging from host {}", host.fullname);
-    pull_and_merge_with(base, |req| async move {
+    let total_objects_hint = match crate::rpc_to_host(host, "status", None, base).await? {
+        protocol::Response::Status { object_count, .. } => Some(object_count),
+        _ => None,
+    };
+
+    pull_and_merge_with(base, total_objects_hint, |req| async move {
         crate::rpc_to_host(host, "pull", Some(&req), base).await
     })
     .await
@@ -207,6 +216,7 @@ pub(crate) async fn pull_and_merge_from_host(
 
 pub(crate) async fn pull_and_merge_with<F, Fut>(
     base: &Path,
+    total_objects_hint: Option<usize>,
     send: F,
 ) -> anyhow::Result<()>
 where
@@ -222,7 +232,7 @@ where
     );
 
     let (remote_head, fetched_objects, fetched_chunks) =
-        fetch_remote_objects(local.repo_uuid, &local_object_ids, send).await?;
+        fetch_remote_objects(local.repo_uuid, &local_object_ids, total_objects_hint, send).await?;
 
     std::fs::create_dir_all(base.join(".syncup/chunks")).expect("failed to create .syncup/chunks");
     for (id, data) in fetched_chunks {
@@ -241,7 +251,8 @@ where
     let mut merged = Repository::load(base);
     merged.merge(remote_repo);
     merged.save(base);
-    debug!("merge complete, repository saved");
+    checkout_head(base, &merged)?;
+    debug!("merge complete, repository saved and checked out");
 
     Ok(())
 }
@@ -378,9 +389,15 @@ pub async fn clone_from_resolved_host(
     );
 
     let local_object_ids = BTreeSet::new();
+    let total_objects_hint = match crate::rpc_to_host(host, "status", None, Path::new(".")).await? {
+        protocol::Response::Status { object_count, .. } => Some(object_count),
+        _ => None,
+    };
+
     let (remote_head, fetched_objects, fetched_chunks) = fetch_remote_objects(
         repo.repo_uuid,
         &local_object_ids,
+        total_objects_hint,
         |req| async move { crate::rpc_to_host(host, "pull", Some(&req), Path::new(".")).await },
     )
     .await?;

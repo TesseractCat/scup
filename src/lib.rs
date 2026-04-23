@@ -648,8 +648,13 @@ pub async fn debug_status(host_id: &str) -> anyhow::Result<()> {
 
     let response = rpc_to_host(&host, "status", None, Path::new(".")).await?;
     match response {
-        protocol::Response::Status { head } => {
-            info!("- {} status: head={}", host.fullname, to_hex(&head.0));
+        protocol::Response::Status { head, object_count } => {
+            info!(
+                "- {} status: head={} objects={}",
+                host.fullname,
+                to_hex(&head.0),
+                object_count
+            );
         }
         protocol::Response::Error(err) => {
             info!("- {} error: {}", host.fullname, err);

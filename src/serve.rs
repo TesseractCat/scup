@@ -173,8 +173,10 @@ fn load_repository() -> Result<Repository> {
 // ── Request handlers ──────────────────────────────────────────────────────────
 
 fn handle_status() -> Result<Response> {
+    let repo = load_repository()?;
     Ok(Response::Status {
-        head: load_repository()?.head,
+        head: repo.head,
+        object_count: repo.objects.len(),
     })
 }
 
@@ -247,7 +249,7 @@ async fn handle_push_by_pulling(repo_uuid: [u8; 32], handle: Handle) -> Result<R
     let base = std::path::Path::new(".");
 
     info!("push-triggered pull for repo {}", to_hex(&repo_uuid));
-    crate::pull_and_merge_with(base, |req| {
+    crate::pull_and_merge_with(base, None, |req| {
         let handle = handle.clone();
         async move { crate::rpc(&handle, req).await }
     })

@@ -21,6 +21,7 @@ pub enum Request {
 pub enum Response {
     Status {
         head: ObjectId,
+        object_count: usize,
     },
     PullSnapshotIds {
         head: ObjectId,
