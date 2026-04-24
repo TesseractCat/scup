@@ -198,20 +198,142 @@ where
     Ok((remote_head, fetched_objects, fetched_chunks))
 }
 
+async fn fetch_remote_objects_over_channel(
+    channel: &mut russh::Channel<russh::client::Msg>,
+    repo_uuid: [u8; 32],
+    local_object_ids: &BTreeSet<ObjectId>,
+    total_objects_hint: Option<usize>,
+) -> anyhow::Result<(ObjectId, BTreeMap<ObjectId, Object>, BTreeMap<ObjectId, Vec<u8>>)> {
+    let response = crate::rpc(channel, &protocol::Request::PullSnapshotIds { repo_uuid }).await?;
+
+    let (remote_head, snapshot_ids) = match response {
+        protocol::Response::PullSnapshotIds { head, snapshot_ids } => (head, snapshot_ids),
+        protocol::Response::Error(err) => anyhow::bail!("snapshot id pull failed: {err}"),
+        _ => anyhow::bail!("unexpected response to PullSnapshotIds"),
+    };
+
+    debug!(
+        "received snapshot ids: remote_head={}, snapshot_count={}",
+        to_hex(&remote_head.0),
+        snapshot_ids.len()
+    );
+
+    let mut need: BTreeSet<ObjectId> = snapshot_ids
+        .into_iter()
+        .filter(|id| !local_object_ids.contains(id))
+        .collect();
+
+    let mut pulled_count = 0usize;
+    let hinted_missing = total_objects_hint
+        .map(|total| total.saturating_sub(local_object_ids.len()))
+        .unwrap_or(0);
+    let mut pull_bar = Bar::new(need.len().max(hinted_missing).max(1));
+    pull_bar.set_description("Pulling objects");
+
+    let mut fetched_objects: BTreeMap<ObjectId, Object> = BTreeMap::new();
+    let mut fetched_chunks: BTreeMap<ObjectId, Vec<u8>> = BTreeMap::new();
+
+    const MAX_OBJECT_IDS_PER_PULL: usize = 64;
+
+    while !need.is_empty() {
+        let req_ids: Vec<ObjectId> = need.iter().take(MAX_OBJECT_IDS_PER_PULL).copied().collect();
+        for id in &req_ids {
+            need.remove(id);
+        }
+        debug!("requesting {} objects", req_ids.len());
+
+        let response = crate::rpc(
+            channel,
+            &protocol::Request::PullObjects {
+                repo_uuid,
+                object_ids: req_ids,
+            },
+        )
+        .await?;
+
+        let (objects, chunks) = match response {
+            protocol::Response::PullObjects { objects, chunks } => (objects, chunks),
+            protocol::Response::Error(err) => anyhow::bail!("object pull failed: {err}"),
+            _ => anyhow::bail!("unexpected response to PullObjects"),
+        };
+
+        debug!(
+            "received object batch: objects={}, chunks={}",
+            objects.len(),
+            chunks.len()
+        );
+
+        for (id, data) in chunks {
+            fetched_chunks.entry(id).or_insert(data);
+        }
+
+        for (id, obj) in objects {
+            if local_object_ids.contains(&id) || fetched_objects.contains_key(&id) {
+                continue;
+            }
+            for child in object_refs(&obj) {
+                if !local_object_ids.contains(&child) && !fetched_objects.contains_key(&child) {
+                    need.insert(child);
+                }
+            }
+            fetched_objects.insert(id, obj);
+            pulled_count += 1;
+            let _ = pull_bar.update(1);
+        }
+
+        let expected_total = pulled_count + need.len();
+        if expected_total > pull_bar.total {
+            pull_bar.total = expected_total;
+        }
+    }
+
+    if pull_bar.counter < pull_bar.total {
+        let _ = pull_bar.update(pull_bar.total - pull_bar.counter);
+    }
+
+    debug!(
+        "finished pull graph walk: fetched_objects={}, fetched_chunks={}",
+        fetched_objects.len(),
+        fetched_chunks.len()
+    );
+
+    Ok((remote_head, fetched_objects, fetched_chunks))
+}
+
 pub(crate) async fn fetch_and_merge_from_host(
     base: &Path,
     host: &scan::ScannedHost,
 ) -> anyhow::Result<()> {
     debug!("fetching and merging from host {}", host.fullname);
-    let total_objects_hint = match crate::rpc_to_host(host, &protocol::Request::Status, base).await? {
+
+    let session = crate::connect_and_auth(host, base).await?;
+    let mut channel = session.channel_open_session().await?;
+
+    let total_objects_hint = match crate::rpc(&mut channel, &protocol::Request::Status).await? {
         protocol::Response::Status { object_count, .. } => Some(object_count),
         _ => None,
     };
 
-    fetch_and_merge_with(base, total_objects_hint, |req| async move {
-        crate::rpc_to_host(host, &req, base).await
-    })
-    .await
+    let local = Repository::load(base);
+    let local_object_ids: BTreeSet<ObjectId> = local.objects.keys().copied().collect();
+
+    let (remote_head, fetched_objects, fetched_chunks) = fetch_remote_objects_over_channel(
+        &mut channel,
+        local.repo_uuid,
+        &local_object_ids,
+        total_objects_hint,
+    )
+    .await?;
+
+    merge_fetched_into_local(base, remote_head, fetched_objects, fetched_chunks)?;
+
+    let _ = channel.eof().await;
+    let _ = channel.close().await;
+    let _ = session
+        .disconnect(russh::Disconnect::ByApplication, "", "English")
+        .await;
+
+    Ok(())
 }
 
 pub(crate) async fn fetch_and_merge_with<F, Fut>(
@@ -233,6 +355,18 @@ where
 
     let (remote_head, fetched_objects, fetched_chunks) =
         fetch_remote_objects(local.repo_uuid, &local_object_ids, total_objects_hint, send).await?;
+
+    merge_fetched_into_local(base, remote_head, fetched_objects, fetched_chunks)?;
+    Ok(())
+}
+
+fn merge_fetched_into_local(
+    base: &Path,
+    remote_head: ObjectId,
+    fetched_objects: BTreeMap<ObjectId, Object>,
+    fetched_chunks: BTreeMap<ObjectId, Vec<u8>>,
+) -> anyhow::Result<()> {
+    let local = Repository::load(base);
 
     std::fs::create_dir_all(base.join(".syncup/chunks")).expect("failed to create .syncup/chunks");
     for (id, data) in fetched_chunks {
@@ -420,18 +554,27 @@ pub async fn clone_from_resolved_host(
     );
 
     let local_object_ids = BTreeSet::new();
-    let total_objects_hint = match crate::rpc_to_host(host, &protocol::Request::Status, Path::new(".")).await? {
+    let session = crate::connect_and_auth(host, Path::new(".")).await?;
+    let mut channel = session.channel_open_session().await?;
+
+    let total_objects_hint = match crate::rpc(&mut channel, &protocol::Request::Status).await? {
         protocol::Response::Status { object_count, .. } => Some(object_count),
         _ => None,
     };
 
-    let (remote_head, fetched_objects, fetched_chunks) = fetch_remote_objects(
+    let (remote_head, fetched_objects, fetched_chunks) = fetch_remote_objects_over_channel(
+        &mut channel,
         repo.repo_uuid,
         &local_object_ids,
         total_objects_hint,
-        |req| async move { crate::rpc_to_host(host, &req, Path::new(".")).await },
     )
     .await?;
+
+    let _ = channel.eof().await;
+    let _ = channel.close().await;
+    let _ = session
+        .disconnect(russh::Disconnect::ByApplication, "", "English")
+        .await;
 
     std::fs::create_dir_all(dest.join(".syncup/chunks"))?;
     for (id, data) in fetched_chunks {

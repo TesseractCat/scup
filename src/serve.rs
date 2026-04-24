@@ -60,69 +60,80 @@ impl Handler for ConnectionHandler {
         Ok(true)
     }
 
-    /// Accumulates incoming request data.
+    /// Accumulates request data and responds as soon as a full framed message is available.
     async fn data(
         &mut self,
-        _channel: ChannelId,
+        channel: ChannelId,
         data: &[u8],
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<()> {
         self.pending_request.extend_from_slice(data);
         debug!("buffered {} bytes of request payload", data.len());
+
+        while let Some(frame) = crate::protocol::pop_framed_message(&mut self.pending_request) {
+            let repo_cache = self.repo_cache.clone();
+            let handle = session.handle();
+            tokio::spawn(async move {
+                let response = match crate::protocol::decode_request(&frame) {
+                    Ok(request) => dispatch_request(request, &repo_cache, handle.clone()).await,
+                    Err(err) => Response::Error(err.to_string()),
+                };
+                let _ = send_response_frame(channel, handle, &response).await;
+            });
+        }
+
         Ok(())
     }
 
-    /// Client closed its write side - process buffered request payload.
+    /// Client closed write side: close response side after flushing framed replies.
     async fn channel_eof(&mut self, channel: ChannelId, session: &mut Session) -> Result<()> {
-        let buf = std::mem::take(&mut self.pending_request);
-        debug!("channel eof on {:?}: payload_bytes={}", channel, buf.len());
+        debug!(
+            "channel eof on {:?}: trailing buffered bytes={}",
+            channel,
+            self.pending_request.len()
+        );
 
-        let request = match crate::protocol::decode_request(&buf) {
-            Ok(req) => req,
-            Err(err) => {
-                let handle = session.handle();
-                tokio::spawn(async move {
-                    let _ = send_response(channel, handle, &Response::Error(err.to_string())).await;
-                });
-                return Ok(());
-            }
-        };
+        if !self.pending_request.is_empty() {
+            let response = Response::Error("incomplete framed request at EOF".into());
+            let _ = send_response_frame(channel, session.handle(), &response).await;
+            self.pending_request.clear();
+        }
 
-        let handle = session.handle();
-        let repo_cache = self.repo_cache.clone();
-        tokio::spawn(async move {
-            let response = match request {
-                Request::Status => handle_status(&repo_cache).await,
-                Request::Push { repo_uuid } => {
-                    handle_push_by_pulling(repo_uuid, handle.clone(), repo_cache).await
-                }
-                Request::PullSnapshotIds { repo_uuid } => {
-                    handle_pull_snapshot_ids(repo_uuid, &repo_cache).await
-                }
-                Request::PullObjects {
-                    repo_uuid,
-                    object_ids,
-                } => handle_pull_objects(repo_uuid, &object_ids, &repo_cache).await,
-            }
-            .unwrap_or_else(|e| Response::Error(e.to_string()));
-
-            let _ = send_response(channel, handle, &response).await;
-        });
-
+        let _ = session.handle().eof(channel).await;
+        let _ = session.handle().close(channel).await;
         Ok(())
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-async fn send_response(channel: ChannelId, handle: Handle, response: &Response) -> Result<()> {
+async fn send_response_frame(channel: ChannelId, handle: Handle, response: &Response) -> Result<()> {
     let bytes = crate::protocol::encode_response(response)?;
     for chunk in bytes.chunks(32 * 1024) {
         let _ = handle.data(channel, chunk.to_vec().into()).await;
     }
-    let _ = handle.eof(channel).await;
-    let _ = handle.close(channel).await;
     Ok(())
+}
+
+async fn dispatch_request(
+    request: Request,
+    repo_cache: &Arc<RwLock<Option<Repository>>>,
+    handle: Handle,
+) -> Response {
+    match request {
+        Request::Status => handle_status(repo_cache).await,
+        Request::Push { repo_uuid } => {
+            handle_push_by_pulling(repo_uuid, handle, repo_cache.clone()).await
+        }
+        Request::PullSnapshotIds { repo_uuid } => {
+            handle_pull_snapshot_ids(repo_uuid, repo_cache).await
+        }
+        Request::PullObjects {
+            repo_uuid,
+            object_ids,
+        } => handle_pull_objects(repo_uuid, &object_ids, repo_cache).await,
+    }
+    .unwrap_or_else(|e| Response::Error(e.to_string()))
 }
 
 fn load_repository(base: &Path) -> Result<Repository> {
@@ -271,6 +282,14 @@ async fn handle_pull_objects(
     Ok(Response::PullObjects { objects, chunks })
 }
 
+async fn rpc_via_handle(handle: &Handle, request: &Request) -> Result<Response> {
+    let mut channel = handle.channel_open_session().await?;
+    let response = crate::rpc(&mut channel, request).await?;
+    let _ = channel.eof().await;
+    let _ = channel.close().await;
+    Ok(response)
+}
+
 async fn handle_push_by_pulling(
     repo_uuid: [u8; 32],
     handle: Handle,
@@ -282,7 +301,7 @@ async fn handle_push_by_pulling(
     info!("push-triggered pull for repo {}", to_hex(&repo_uuid));
     crate::fetch_and_merge_with(base, None, |req| {
         let handle = handle.clone();
-        async move { crate::rpc(&handle, req).await }
+        async move { rpc_via_handle(&handle, &req).await }
     })
     .await?;
     crate::checkout_head(base)?;
