@@ -40,12 +40,30 @@ pub fn cli() -> Command {
                 .arg(arg!(-m --message <MESSAGE> "Snapshot message").required(false)),
         )
         .subcommand(Command::new("push").about("Scan and push this repository to matching hosts"))
-        .subcommand(Command::new("pull").about("Scan and pull this repository from matching hosts"))
+        .subcommand(
+            Command::new("pull")
+                .about("Scan and pull this repository from matching hosts")
+                .arg(
+                    arg!(--fetch "Fetch+merge only; do not update working tree")
+                        .required(false)
+                        .action(ArgAction::SetTrue),
+                ),
+        )
         .subcommand(
             Command::new("clone")
                 .about("Clone a repository from a scanned host")
                 .arg(arg!(<HOST> "Host id as printed by `scan`"))
-                .arg(arg!(<REPO> "Repo root name or repo id")),
+                .arg(arg!(<REPO> "Repo root name or repo id"))
+                .arg(
+                    arg!(--bare "Clone metadata/objects only; do not check out files")
+                        .required(false)
+                        .action(ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
+            Command::new("checkout")
+                .about("Check out a snapshot hash into the working tree")
+                .arg(arg!(<SNAPSHOT> "64-char snapshot object hash")),
         )
         .subcommand(
             Command::new("scan")

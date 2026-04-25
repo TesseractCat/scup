@@ -198,23 +198,23 @@ where
     Ok((remote_head, fetched_objects, fetched_chunks))
 }
 
-pub(crate) async fn pull_and_merge_from_host(
+pub(crate) async fn fetch_and_merge_from_host(
     base: &Path,
     host: &scan::ScannedHost,
 ) -> anyhow::Result<()> {
-    debug!("pulling and merging from host {}", host.fullname);
-    let total_objects_hint = match crate::rpc_to_host(host, "status", None, base).await? {
+    debug!("fetching and merging from host {}", host.fullname);
+    let total_objects_hint = match crate::rpc_to_host(host, &protocol::Request::Status, base).await? {
         protocol::Response::Status { object_count, .. } => Some(object_count),
         _ => None,
     };
 
-    pull_and_merge_with(base, total_objects_hint, |req| async move {
-        crate::rpc_to_host(host, "pull", Some(&req), base).await
+    fetch_and_merge_with(base, total_objects_hint, |req| async move {
+        crate::rpc_to_host(host, &req, base).await
     })
     .await
 }
 
-pub(crate) async fn pull_and_merge_with<F, Fut>(
+pub(crate) async fn fetch_and_merge_with<F, Fut>(
     base: &Path,
     total_objects_hint: Option<usize>,
     send: F,
@@ -226,7 +226,7 @@ where
     let local = Repository::load(base);
     let local_object_ids: BTreeSet<ObjectId> = local.objects.keys().copied().collect();
     debug!(
-        "starting pull-and-merge: local_head={}, local_objects={}",
+        "starting fetch-and-merge: local_head={}, local_objects={}",
         to_hex(&local.head.0),
         local_object_ids.len()
     );
@@ -251,8 +251,7 @@ where
     let mut merged = Repository::load(base);
     merged.merge(remote_repo);
     merged.save(base);
-    checkout_head(base, &merged)?;
-    debug!("merge complete, repository saved and checked out");
+    debug!("merge complete, repository saved");
 
     Ok(())
 }
@@ -329,10 +328,14 @@ fn blob_bytes(repo: &Repository, base: &Path, blob_id: ObjectId) -> anyhow::Resu
     Ok(out)
 }
 
-fn checkout_head(base: &Path, repo: &Repository) -> anyhow::Result<()> {
-    let snap = match repo.objects.get(&repo.head) {
+fn checkout_snapshot_from_repo(
+    base: &Path,
+    repo: &Repository,
+    snapshot_id: ObjectId,
+) -> anyhow::Result<()> {
+    let snap = match repo.objects.get(&snapshot_id) {
         Some(Object::Snapshot(s)) => s,
-        _ => anyhow::bail!("head is not a snapshot"),
+        _ => anyhow::bail!("requested object is not a snapshot: {}", to_hex(&snapshot_id.0)),
     };
 
     let tree = match repo.objects.get(&snap.tree) {
@@ -357,10 +360,37 @@ fn checkout_head(base: &Path, repo: &Repository) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn parse_object_id_hex(hex: &str) -> anyhow::Result<ObjectId> {
+    let trimmed = hex.trim();
+    if trimmed.len() != 64 {
+        anyhow::bail!("snapshot hash must be 64 hex characters");
+    }
+
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&trimmed[i * 2..i * 2 + 2], 16)
+            .map_err(|_| anyhow::anyhow!("invalid snapshot hash: non-hex characters"))?;
+    }
+    Ok(ObjectId(out))
+}
+
+pub fn checkout(base: &Path, snapshot_hash: &str) -> anyhow::Result<()> {
+    let snapshot_id = parse_object_id_hex(snapshot_hash)?;
+    let repo = Repository::load(base);
+    checkout_snapshot_from_repo(base, &repo, snapshot_id)
+}
+
+pub fn checkout_head(base: &Path) -> anyhow::Result<()> {
+    let repo = Repository::load(base);
+    let head_hash = to_hex(&repo.head.0);
+    checkout(base, &head_hash)
+}
+
 pub async fn clone_from_resolved_host(
     base: &Path,
     host: &scan::ScannedHost,
     repo_selector: &str,
+    bare: bool,
 ) -> anyhow::Result<()> {
     let repo = choose_repo(host, repo_selector).ok_or_else(|| {
         anyhow::anyhow!(
@@ -381,15 +411,16 @@ pub async fn clone_from_resolved_host(
     }
 
     info!(
-        "cloning repo {} ({}) from {} into {}",
+        "cloning repo {} ({}) from {} into {}{}",
         repo.root,
         to_hex(&repo.repo_uuid),
         host.fullname,
-        dest.display()
+        dest.display(),
+        if bare { " [bare]" } else { "" }
     );
 
     let local_object_ids = BTreeSet::new();
-    let total_objects_hint = match crate::rpc_to_host(host, "status", None, Path::new(".")).await? {
+    let total_objects_hint = match crate::rpc_to_host(host, &protocol::Request::Status, Path::new(".")).await? {
         protocol::Response::Status { object_count, .. } => Some(object_count),
         _ => None,
     };
@@ -398,7 +429,7 @@ pub async fn clone_from_resolved_host(
         repo.repo_uuid,
         &local_object_ids,
         total_objects_hint,
-        |req| async move { crate::rpc_to_host(host, "pull", Some(&req), Path::new(".")).await },
+        |req| async move { crate::rpc_to_host(host, &req, Path::new(".")).await },
     )
     .await?;
 
@@ -413,13 +444,17 @@ pub async fn clone_from_resolved_host(
         head: remote_head,
     };
     repo_data.save(&dest);
-    checkout_head(&dest, &repo_data)?;
 
-    info!("clone complete: {}", dest.display());
+    if !bare {
+        let head_hash = to_hex(&repo_data.head.0);
+        checkout(&dest, &head_hash)?;
+    }
+
+    info!("clone complete{}: {}", if bare { " (bare)" } else { "" }, dest.display());
     Ok(())
 }
 
-pub async fn pull_all(base: &Path) -> anyhow::Result<()> {
+pub async fn fetch_all(base: &Path) -> anyhow::Result<()> {
     let local = Repository::load(base);
     let hosts = scan::scan_hosts(3)?;
 
@@ -428,11 +463,16 @@ pub async fn pull_all(base: &Path) -> anyhow::Result<()> {
             continue;
         }
 
-        match pull_and_merge_from_host(base, &host).await {
-            Ok(()) => info!("- pulled from {}", host.fullname),
-            Err(err) => info!("- pull from {} failed: {}", host.fullname, err),
+        match fetch_and_merge_from_host(base, &host).await {
+            Ok(()) => info!("- fetched from {}", host.fullname),
+            Err(err) => info!("- fetch from {} failed: {}", host.fullname, err),
         }
     }
 
     Ok(())
+}
+
+pub async fn pull_all(base: &Path) -> anyhow::Result<()> {
+    fetch_all(base).await?;
+    checkout_head(base)
 }

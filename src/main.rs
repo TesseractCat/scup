@@ -62,8 +62,13 @@ fn main() -> anyhow::Result<()> {
         Some(("push", _)) => {
             tokio::runtime::Runtime::new()?.block_on(syncup::push_all(Path::new(".")))?;
         }
-        Some(("pull", _)) => {
-            tokio::runtime::Runtime::new()?.block_on(syncup::pull_all(Path::new(".")))?;
+        Some(("pull", sub)) => {
+            let fetch_only = sub.get_flag("fetch");
+            if fetch_only {
+                tokio::runtime::Runtime::new()?.block_on(syncup::fetch_all(Path::new(".")))?;
+            } else {
+                tokio::runtime::Runtime::new()?.block_on(syncup::pull_all(Path::new(".")))?;
+            }
         }
         Some(("clone", sub)) => {
             let host_id = sub
@@ -72,7 +77,14 @@ fn main() -> anyhow::Result<()> {
             let repo = sub
                 .get_one::<String>("REPO")
                 .expect("REPO is required by clap");
-            tokio::runtime::Runtime::new()?.block_on(syncup::clone_from(host_id, repo))?;
+            let bare = sub.get_flag("bare");
+            tokio::runtime::Runtime::new()?.block_on(syncup::clone_from(host_id, repo, bare))?;
+        }
+        Some(("checkout", sub)) => {
+            let snapshot = sub
+                .get_one::<String>("SNAPSHOT")
+                .expect("SNAPSHOT is required by clap");
+            syncup::checkout(Path::new("."), snapshot)?;
         }
         Some(("serve", sub)) => {
             let port = *sub

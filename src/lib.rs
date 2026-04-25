@@ -23,8 +23,8 @@ mod protocol;
 mod serve;
 mod pull;
 
-pub use pull::pull_all;
-pub(crate) use pull::pull_and_merge_with;
+pub use pull::{checkout, checkout_head, fetch_all, pull_all};
+pub(crate) use pull::fetch_and_merge_with;
 
 struct ChunkReader<R: Read> {
     reader: R,
@@ -585,20 +585,16 @@ pub(crate) async fn connect_and_auth(
 
 pub(crate) async fn rpc_to_host(
     host: &scan::ScannedHost,
-    command: &str,
-    request: Option<&protocol::Request>,
+    request: &protocol::Request,
     base: &Path,
 ) -> anyhow::Result<protocol::Response> {
     let session = connect_and_auth(host, base).await?;
 
     let mut channel = session.channel_open_session().await?;
-    channel.exec(false, command).await?;
 
-    if let Some(req) = request {
-        let bytes = protocol::encode_request(req)?;
-        channel.data(bytes.as_slice()).await?;
-        channel.eof().await?;
-    }
+    let bytes = protocol::encode_request(request)?;
+    channel.data(bytes.as_slice()).await?;
+    channel.eof().await?;
 
     let mut raw = Vec::new();
     while let Some(msg) = channel.wait().await {
@@ -646,7 +642,7 @@ pub(crate) async fn rpc(
 pub async fn debug_status(host_id: &str) -> anyhow::Result<()> {
     let host = scan::resolve_host(host_id, 3)?;
 
-    let response = rpc_to_host(&host, "status", None, Path::new(".")).await?;
+    let response = rpc_to_host(&host, &protocol::Request::Status, Path::new(".")).await?;
     match response {
         protocol::Response::Status { head, object_count } => {
             info!(
@@ -678,10 +674,9 @@ pub async fn push_all(base: &Path) -> anyhow::Result<()> {
 
         let response = rpc_to_host(
             &host,
-            "push",
-            Some(&protocol::Request::Push {
+            &protocol::Request::Push {
                 repo_uuid: local.repo_uuid,
-            }),
+            },
             base,
         )
         .await;
@@ -709,9 +704,9 @@ pub async fn serve_on(port: u16) -> anyhow::Result<()> {
     serve::serve(port).await
 }
 
-pub async fn clone_from(host_id: &str, repo_selector: &str) -> anyhow::Result<()> {
+pub async fn clone_from(host_id: &str, repo_selector: &str, bare: bool) -> anyhow::Result<()> {
     let host = scan::resolve_host(host_id, 3)?;
-    pull::clone_from_resolved_host(Path::new("."), &host, repo_selector).await
+    pull::clone_from_resolved_host(Path::new("."), &host, repo_selector, bare).await
 }
 
 pub fn debug_chunk_file(path: &Path) {
