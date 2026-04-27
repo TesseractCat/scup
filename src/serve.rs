@@ -131,6 +131,9 @@ async fn dispatch_request(
 ) -> Response {
     info!("request: {request:?}");
     match request {
+        Request::Version => Ok(Response::Version {
+            version: crate::protocol::PROTOCOL_VERSION,
+        }),
         Request::Status => handle_status(repo_cache).await,
         Request::Push { repo_uuid } => {
             handle_push_by_pulling(repo_uuid, handle, repo_cache.clone()).await

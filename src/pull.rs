@@ -41,6 +41,9 @@ pub(crate) fn local_pull_response(base: &Path, req: protocol::Request) -> protoc
     };
 
     match req {
+        protocol::Request::Version => protocol::Response::Version {
+            version: protocol::PROTOCOL_VERSION,
+        },
         protocol::Request::PullSnapshotIds { repo_uuid } => match ensure(repo_uuid) {
             Ok(repo) => {
                 let snapshot_ids = repo

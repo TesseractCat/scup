@@ -133,6 +133,29 @@ pub(crate) async fn connect_and_auth(
         anyhow::bail!("authentication failed");
     }
 
+    let mut version_channel = session.channel_open_session().await?;
+    let version_response = rpc(&mut version_channel, &protocol::Request::Version).await;
+    let _ = version_channel.eof().await;
+    let _ = version_channel.close().await;
+
+    match version_response? {
+        protocol::Response::Version { version } => {
+            if version != protocol::PROTOCOL_VERSION {
+                anyhow::bail!(
+                    "protocol version mismatch: local={}, remote={}",
+                    protocol::PROTOCOL_VERSION,
+                    version
+                );
+            }
+        }
+        protocol::Response::Error(err) => {
+            anyhow::bail!("version check failed: {err}");
+        }
+        other => {
+            anyhow::bail!("unexpected response to Version: {other:?}");
+        }
+    }
+
     Ok(session)
 }
 

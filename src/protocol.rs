@@ -3,8 +3,11 @@ use anyhow::{Context, Result};
 use derive_more::Debug;
 use serde::{Deserialize, Serialize};
 
+pub const PROTOCOL_VERSION: usize = 1;
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
+    Version,
     Status,
     Push {
         repo_uuid: [u8; 32],
@@ -21,6 +24,9 @@ pub enum Request {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Response {
+    Version {
+        version: usize,
+    },
     Status {
         head: ObjectId,
         object_count: usize,
