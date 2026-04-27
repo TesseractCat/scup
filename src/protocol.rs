@@ -1,5 +1,6 @@
-use anyhow::{Context, Result};
 use crate::{Object, ObjectId};
+use anyhow::{Context, Result};
+use derive_more::Debug;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -13,6 +14,7 @@ pub enum Request {
     },
     PullObjects {
         repo_uuid: [u8; 32],
+        #[debug(skip)]
         object_ids: Vec<ObjectId>,
     },
 }
@@ -49,13 +51,18 @@ fn unframe(bytes: &[u8]) -> Result<&[u8]> {
     let len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
     let payload = &bytes[4..];
     if payload.len() < len {
-        anyhow::bail!("incomplete framed message: expected {len} bytes, got {}", payload.len());
+        anyhow::bail!(
+            "incomplete framed message: expected {len} bytes, got {}",
+            payload.len()
+        );
     }
     Ok(&payload[..len])
 }
 
 pub fn encode_request(req: &Request) -> Result<Vec<u8>> {
-    Ok(frame(postcard::to_allocvec(req).context("serialize request")?))
+    Ok(frame(
+        postcard::to_allocvec(req).context("serialize request")?,
+    ))
 }
 
 pub fn decode_request(bytes: &[u8]) -> Result<Request> {
@@ -63,7 +70,9 @@ pub fn decode_request(bytes: &[u8]) -> Result<Request> {
 }
 
 pub fn encode_response(resp: &Response) -> Result<Vec<u8>> {
-    Ok(frame(postcard::to_allocvec(resp).context("serialize response")?))
+    Ok(frame(
+        postcard::to_allocvec(resp).context("serialize response")?,
+    ))
 }
 
 pub fn decode_response(bytes: &[u8]) -> Result<Response> {

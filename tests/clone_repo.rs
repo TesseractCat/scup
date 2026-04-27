@@ -16,7 +16,10 @@ fn wait_for_scan_host(local_dir: &Path, expected_fullname: &str, timeout: Durati
         let output = run_ok(
             {
                 let mut cmd = Command::new(bin());
-                cmd.current_dir(local_dir).arg("scan").arg("--timeout").arg("2");
+                cmd.current_dir(local_dir)
+                    .arg("scan")
+                    .arg("--timeout")
+                    .arg("2");
                 cmd
             },
             "syncup scan",
@@ -34,7 +37,8 @@ fn wait_for_scan_host(local_dir: &Path, expected_fullname: &str, timeout: Durati
 }
 
 fn sha256_file(path: &Path) -> String {
-    let mut file = fs::File::open(path).unwrap_or_else(|e| panic!("failed to open {}: {e}", path.display()));
+    let mut file =
+        fs::File::open(path).unwrap_or_else(|e| panic!("failed to open {}: {e}", path.display()));
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1024 * 1024];
 
@@ -122,8 +126,14 @@ fn clone_repo_from_host_by_root_name() {
         cloned_repo_dir.join(".syncup/repository").exists(),
         "cloned repository file missing"
     );
-    assert!(cloned_repo_dir.join("hello.txt").exists(), "cloned hello.txt missing");
-    assert!(cloned_repo_dir.join("random.bin").exists(), "cloned random.bin missing");
+    assert!(
+        cloned_repo_dir.join("hello.txt").exists(),
+        "cloned hello.txt missing"
+    );
+    assert!(
+        cloned_repo_dir.join("random.bin").exists(),
+        "cloned random.bin missing"
+    );
 
     let src_repo = syncup::Repository::load(&origin);
     let cloned_repo = syncup::Repository::load(&cloned_repo_dir);

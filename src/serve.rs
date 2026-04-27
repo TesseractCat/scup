@@ -18,6 +18,7 @@ use crate::{Object, ObjectId, Repository, to_hex};
 
 struct SyncupServer {
     repo_cache: Arc<RwLock<Option<Repository>>>,
+    allowed_client_key: Option<russh_keys::key::PublicKey>,
 }
 
 impl Server for SyncupServer {
@@ -27,6 +28,7 @@ impl Server for SyncupServer {
         ConnectionHandler {
             pending_request: Vec::new(),
             repo_cache: self.repo_cache.clone(),
+            allowed_client_key: self.allowed_client_key.clone(),
         }
     }
 }
@@ -35,6 +37,7 @@ impl Server for SyncupServer {
 struct ConnectionHandler {
     pending_request: Vec<u8>,
     repo_cache: Arc<RwLock<Option<Repository>>>,
+    allowed_client_key: Option<russh_keys::key::PublicKey>,
 }
 
 #[async_trait]
@@ -43,12 +46,18 @@ impl Handler for ConnectionHandler {
 
     async fn auth_publickey(
         &mut self,
-        _user: &str,
-        _public_key: &russh_keys::key::PublicKey,
+        user: &str,
+        public_key: &russh_keys::key::PublicKey,
     ) -> Result<Auth> {
-        info!("credentials: {_user}, {_public_key:?}");
-        // Accept any key that completes the SSH handshake.
-        // Add authorized-keys enforcement here when needed.
+        if let Some(expected) = &self.allowed_client_key {
+            if public_key != expected {
+                info!("credentials rejected: {user}");
+                return Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                });
+            }
+        }
+        info!("credentials accepted: {user}");
         Ok(Auth::Accept)
     }
 
@@ -61,12 +70,7 @@ impl Handler for ConnectionHandler {
     }
 
     /// Accumulates request data and responds as soon as a full framed message is available.
-    async fn data(
-        &mut self,
-        channel: ChannelId,
-        data: &[u8],
-        session: &mut Session,
-    ) -> Result<()> {
+    async fn data(&mut self, channel: ChannelId, data: &[u8], session: &mut Session) -> Result<()> {
         self.pending_request.extend_from_slice(data);
         debug!("buffered {} bytes of request payload", data.len());
 
@@ -107,7 +111,11 @@ impl Handler for ConnectionHandler {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-async fn send_response_frame(channel: ChannelId, handle: Handle, response: &Response) -> Result<()> {
+async fn send_response_frame(
+    channel: ChannelId,
+    handle: Handle,
+    response: &Response,
+) -> Result<()> {
     let bytes = crate::protocol::encode_response(response)?;
     for chunk in bytes.chunks(32 * 1024) {
         let _ = handle.data(channel, chunk.to_vec().into()).await;
@@ -120,6 +128,7 @@ async fn dispatch_request(
     repo_cache: &Arc<RwLock<Option<Repository>>>,
     handle: Handle,
 ) -> Response {
+    info!("request: {request:?}");
     match request {
         Request::Status => handle_status(repo_cache).await,
         Request::Push { repo_uuid } => {
@@ -305,7 +314,10 @@ async fn handle_push_by_pulling(
     })
     .await?;
     crate::checkout_head(base)?;
-    info!("push-triggered pull complete for repo {}", to_hex(&repo_uuid));
+    info!(
+        "push-triggered pull complete for repo {}",
+        to_hex(&repo_uuid)
+    );
 
     if let Err(err) = reload_repository_cache(base, &repo_cache).await {
         warn!("push completed, but failed to refresh in-memory repository cache: {err:#}");
@@ -316,20 +328,21 @@ async fn handle_push_by_pulling(
 
 // ── Key loading ───────────────────────────────────────────────────────────────
 
-fn load_host_key() -> Result<KeyPair> {
-    // Prefer the user's own SSH identity key so the host fingerprint is stable.
-    let home = std::env::var("HOME").context("HOME not set")?;
-    let ssh_path = PathBuf::from(home).join(".ssh/id_ed25519");
-    if ssh_path.exists() {
-        return russh_keys::load_secret_key(&ssh_path, None)
-            .context("failed to load ~/.ssh/id_ed25519");
+fn load_server_keys() -> Result<(KeyPair, Option<russh_keys::key::PublicKey>)> {
+    if let Some(path) = crate::resolve_key_path() {
+        let key = russh_keys::load_secret_key(&path, None)
+            .with_context(|| format!("failed to load SSH key {}", path.display()))?;
+        let allowed = Some(
+            key.clone_public_key()
+                .context("failed to derive public key")?,
+        );
+        return Ok((key, allowed));
     }
 
-    // russh-keys has no key-write API, so generate an ephemeral key and warn.
-    warn!(
-        "~/.ssh/id_ed25519 not found; using an ephemeral host key (fingerprint changes on restart)"
-    );
-    KeyPair::generate_ed25519().context("key generation failed")
+    // russh-keys has no key-write API, so generate an ephemeral key and allow any client key.
+    warn!("no SSH key found; using ephemeral host key and accepting any client key");
+    let key = KeyPair::generate_ed25519().context("key generation failed")?;
+    Ok((key, None))
 }
 
 // ── mDNS server scan ────────────────────────────────────────────────────────
@@ -387,10 +400,12 @@ fn current_repo_root_name() -> Option<String> {
 }
 
 pub async fn serve(port: u16) -> Result<()> {
+    let (host_key, allowed_client_key) = load_server_keys()?;
+
     let config = Arc::new(russh::server::Config {
         // RFC 4253: identification string must start with "SSH-2.0-".
         server_id: russh::SshId::Standard("SSH-2.0-syncup-ssh".into()),
-        keys: vec![load_host_key()?],
+        keys: vec![host_key],
         ..Default::default()
     });
 
@@ -415,7 +430,10 @@ pub async fn serve(port: u16) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     info!("Listening on 0.0.0.0:{port}");
 
-    let mut server = SyncupServer { repo_cache };
+    let mut server = SyncupServer {
+        repo_cache,
+        allowed_client_key,
+    };
     loop {
         let (stream, addr) = listener.accept().await?;
         debug!("accepted TCP connection from {addr}");
@@ -430,7 +448,12 @@ pub async fn serve(port: u16) -> Result<()> {
                 }
             };
             if let Err(e) = session.await {
-                error!("Session error [{addr}]: {e:#}");
+                let msg = e.to_string();
+                if msg.to_ascii_lowercase().contains("early eof") {
+                    debug!("Session disconnected [{addr}]: {e:#}");
+                } else {
+                    error!("Session error [{addr}]: {e:#}");
+                }
             }
         });
     }

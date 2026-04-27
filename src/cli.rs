@@ -13,6 +13,11 @@ pub fn cli() -> Command {
                 .global(true)
                 .action(ArgAction::Count),
         )
+        .arg(
+            arg!(--key <PATH> "SSH private key path (overrides auto discovery)")
+                .global(true)
+                .value_parser(value_parser!(PathBuf)),
+        )
         .subcommand(Command::new("init").about("Initialize repository"))
         .subcommand(
             Command::new("debug")

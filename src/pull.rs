@@ -3,8 +3,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::Context;
 use crate::{Blob, List, Object, ObjectId, Repository, protocol, scan, to_hex};
+use anyhow::Context;
 use kdam::{Bar, BarExt};
 use log::{debug, info};
 
@@ -100,7 +100,11 @@ async fn fetch_remote_objects<F, Fut>(
     local_object_ids: &BTreeSet<ObjectId>,
     total_objects_hint: Option<usize>,
     mut send: F,
-) -> anyhow::Result<(ObjectId, BTreeMap<ObjectId, Object>, BTreeMap<ObjectId, Vec<u8>>)>
+) -> anyhow::Result<(
+    ObjectId,
+    BTreeMap<ObjectId, Object>,
+    BTreeMap<ObjectId, Vec<u8>>,
+)>
 where
     F: FnMut(protocol::Request) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<protocol::Response>>,
@@ -203,7 +207,11 @@ async fn fetch_remote_objects_over_channel(
     repo_uuid: [u8; 32],
     local_object_ids: &BTreeSet<ObjectId>,
     total_objects_hint: Option<usize>,
-) -> anyhow::Result<(ObjectId, BTreeMap<ObjectId, Object>, BTreeMap<ObjectId, Vec<u8>>)> {
+) -> anyhow::Result<(
+    ObjectId,
+    BTreeMap<ObjectId, Object>,
+    BTreeMap<ObjectId, Vec<u8>>,
+)> {
     let response = crate::rpc(channel, &protocol::Request::PullSnapshotIds { repo_uuid }).await?;
 
     let (remote_head, snapshot_ids) = match response {
@@ -233,7 +241,7 @@ async fn fetch_remote_objects_over_channel(
     let mut fetched_objects: BTreeMap<ObjectId, Object> = BTreeMap::new();
     let mut fetched_chunks: BTreeMap<ObjectId, Vec<u8>> = BTreeMap::new();
 
-    const MAX_OBJECT_IDS_PER_PULL: usize = 64;
+    const MAX_OBJECT_IDS_PER_PULL: usize = 2048;
 
     while !need.is_empty() {
         let req_ids: Vec<ObjectId> = need.iter().take(MAX_OBJECT_IDS_PER_PULL).copied().collect();
@@ -426,7 +434,11 @@ fn normalize_repo_path(path: &str) -> Option<PathBuf> {
     Some(PathBuf::from(p))
 }
 
-fn collect_chunk_ids(repo: &Repository, list_id: ObjectId, out: &mut Vec<ObjectId>) -> anyhow::Result<()> {
+fn collect_chunk_ids(
+    repo: &Repository,
+    list_id: ObjectId,
+    out: &mut Vec<ObjectId>,
+) -> anyhow::Result<()> {
     let list = match repo.objects.get(&list_id) {
         Some(Object::List(List { entries })) => entries,
         _ => anyhow::bail!("missing list object {}", to_hex(&list_id.0)),
@@ -469,7 +481,10 @@ fn checkout_snapshot_from_repo(
 ) -> anyhow::Result<()> {
     let snap = match repo.objects.get(&snapshot_id) {
         Some(Object::Snapshot(s)) => s,
-        _ => anyhow::bail!("requested object is not a snapshot: {}", to_hex(&snapshot_id.0)),
+        _ => anyhow::bail!(
+            "requested object is not a snapshot: {}",
+            to_hex(&snapshot_id.0)
+        ),
     };
 
     let tree = match repo.objects.get(&snap.tree) {
@@ -538,7 +553,10 @@ pub async fn clone_from_resolved_host(
     if dest.exists() {
         let mut entries = std::fs::read_dir(&dest)?;
         if entries.next().transpose()?.is_some() {
-            anyhow::bail!("destination already exists and is not empty: {}", dest.display());
+            anyhow::bail!(
+                "destination already exists and is not empty: {}",
+                dest.display()
+            );
         }
     } else {
         std::fs::create_dir_all(&dest)?;
@@ -593,7 +611,11 @@ pub async fn clone_from_resolved_host(
         checkout(&dest, &head_hash)?;
     }
 
-    info!("clone complete{}: {}", if bare { " (bare)" } else { "" }, dest.display());
+    info!(
+        "clone complete{}: {}",
+        if bare { " (bare)" } else { "" },
+        dest.display()
+    );
     Ok(())
 }
 
@@ -602,7 +624,11 @@ pub async fn fetch_all(base: &Path) -> anyhow::Result<()> {
     let hosts = scan::scan_hosts(3)?;
 
     for host in hosts {
-        if !host.repos.iter().any(|repo| repo.repo_uuid == local.repo_uuid) {
+        if !host
+            .repos
+            .iter()
+            .any(|repo| repo.repo_uuid == local.repo_uuid)
+        {
             continue;
         }
 

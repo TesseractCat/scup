@@ -1,6 +1,6 @@
 // https://joshleeb.com/posts/gear-hashing.html
 
-pub const SPLIT_BITS: usize = 16; // ~65 KB
+pub const SPLIT_BITS: usize = 17; // ~131 KB
 pub const SPLIT_MASK: u64 = const {
     // FastCDC technique: Evenly distribute mask bits
     let divisions = 64 / SPLIT_BITS;

@@ -20,9 +20,11 @@ fn init_logger(verbosity: u8) {
 
 fn main() -> anyhow::Result<()> {
     let matches = cli().get_matches();
-    init_logger(
-        matches.get_count("verbose"),
-    );
+    init_logger(matches.get_count("verbose"));
+
+    if let Some(key_path) = matches.get_one::<PathBuf>("key") {
+        syncup::set_key_override(key_path.clone());
+    }
 
     match matches.subcommand() {
         Some(("init", _)) => {

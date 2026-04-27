@@ -20,7 +20,8 @@ pub fn unique_temp_dir(prefix: &str) -> PathBuf {
 }
 
 pub fn free_port() -> u16 {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind to an ephemeral port");
+    let listener =
+        TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind to an ephemeral port");
     let port = listener
         .local_addr()
         .expect("failed to read local addr")
@@ -30,7 +31,9 @@ pub fn free_port() -> u16 {
 }
 
 pub fn run_ok(mut cmd: Command, what: &str) -> Output {
-    let output = cmd.output().unwrap_or_else(|e| panic!("failed to run {what}: {e}"));
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {what}: {e}"));
     assert!(
         output.status.success(),
         "{what} failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",

@@ -22,7 +22,11 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
             copy_dir_recursive(&src_path, &dst_path);
         } else if ft.is_file() {
             fs::copy(&src_path, &dst_path).unwrap_or_else(|e| {
-                panic!("failed to copy {} -> {}: {e}", src_path.display(), dst_path.display())
+                panic!(
+                    "failed to copy {} -> {}: {e}",
+                    src_path.display(),
+                    dst_path.display()
+                )
             });
         }
     }
@@ -34,7 +38,10 @@ fn wait_for_scan_hosts(local_dir: &Path, expected_fullnames: &[String], timeout:
         let out = run_ok(
             {
                 let mut cmd = Command::new(bin());
-                cmd.current_dir(local_dir).arg("scan").arg("--timeout").arg("2");
+                cmd.current_dir(local_dir)
+                    .arg("scan")
+                    .arg("--timeout")
+                    .arg("2");
                 cmd
             },
             "syncup scan",
@@ -51,7 +58,6 @@ fn wait_for_scan_hosts(local_dir: &Path, expected_fullnames: &[String], timeout:
 
     panic!("did not discover all expected hosts in time");
 }
-
 
 fn read_repo(dir: &Path) -> Repository {
     let bytes = fs::read(dir.join(".syncup/repository")).expect("failed to read repository file");
@@ -74,7 +80,11 @@ fn blob_for_file<'a>(repo: &'a Repository, filename: &str) -> &'a Blob {
     let (_, blob_id) = tree
         .entries
         .iter()
-        .find(|(path, _)| path.as_str() == filename || path.ends_with(&format!("/{filename}")) || path.as_str() == format!("./{filename}"))
+        .find(|(path, _)| {
+            path.as_str() == filename
+                || path.ends_with(&format!("/{filename}"))
+                || path.as_str() == format!("./{filename}")
+        })
         .unwrap_or_else(|| panic!("file not found in head tree: {filename}"));
 
     match repo.objects.get(blob_id) {
@@ -169,10 +179,15 @@ fn push_pull_multiple_remotes_then_conflict() {
 
     wait_for_tcp(("127.0.0.1", port1), Duration::from_secs(10));
     wait_for_tcp(("127.0.0.1", port2), Duration::from_secs(10));
-    wait_for_scan_hosts(&local, &[full1.clone(), full2.clone()], Duration::from_secs(20));
+    wait_for_scan_hosts(
+        &local,
+        &[full1.clone(), full2.clone()],
+        Duration::from_secs(20),
+    );
 
     // 1) Standard push to multiple remotes.
-    fs::write(local.join("from_local.txt"), b"hello from local\n").expect("failed to write local file");
+    fs::write(local.join("from_local.txt"), b"hello from local\n")
+        .expect("failed to write local file");
     run_ok(
         {
             let mut cmd = Command::new(bin());
@@ -198,8 +213,12 @@ fn push_pull_multiple_remotes_then_conflict() {
     let r2_repo = read_repo(&remote2);
     let r1_tree = head_tree(&r1_repo);
     let r2_tree = head_tree(&r2_repo);
-    assert!(r1_tree.entries.keys().any(|p| p.ends_with("from_local.txt") || p == "from_local.txt" || p == "./from_local.txt"));
-    assert!(r2_tree.entries.keys().any(|p| p.ends_with("from_local.txt") || p == "from_local.txt" || p == "./from_local.txt"));
+    assert!(r1_tree.entries.keys().any(|p| p.ends_with("from_local.txt")
+        || p == "from_local.txt"
+        || p == "./from_local.txt"));
+    assert!(r2_tree.entries.keys().any(|p| p.ends_with("from_local.txt")
+        || p == "from_local.txt"
+        || p == "./from_local.txt"));
     assert_eq!(
         fs::read(remote1.join("from_local.txt")).expect("remote1 missing from_local.txt"),
         b"hello from local\n"
@@ -239,16 +258,20 @@ fn push_pull_multiple_remotes_then_conflict() {
         local_tree_after_pull
             .entries
             .keys()
-            .any(|p| p.ends_with("from_remote1.txt") || p == "from_remote1.txt" || p == "./from_remote1.txt"),
+            .any(|p| p.ends_with("from_remote1.txt")
+                || p == "from_remote1.txt"
+                || p == "./from_remote1.txt"),
         "local repo missing file from remote1 after pull"
     );
     assert_eq!(
-        fs::read(local.join("from_remote1.txt")).expect("local missing from_remote1.txt after pull"),
+        fs::read(local.join("from_remote1.txt"))
+            .expect("local missing from_remote1.txt after pull"),
         b"hello from remote1\n"
     );
 
     // 3) Conflict: remote1 older, remote2 newer; pull should keep newer mtime content.
-    fs::write(remote1.join("conflict.txt"), b"older\n").expect("failed to write conflict on remote1");
+    fs::write(remote1.join("conflict.txt"), b"older\n")
+        .expect("failed to write conflict on remote1");
     run_ok(
         {
             let mut cmd = Command::new(bin());
@@ -263,7 +286,8 @@ fn push_pull_multiple_remotes_then_conflict() {
 
     thread::sleep(Duration::from_millis(1200));
 
-    fs::write(remote2.join("conflict.txt"), b"newer\n").expect("failed to write conflict on remote2");
+    fs::write(remote2.join("conflict.txt"), b"newer\n")
+        .expect("failed to write conflict on remote2");
     run_ok(
         {
             let mut cmd = Command::new(bin());

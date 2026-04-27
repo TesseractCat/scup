@@ -34,9 +34,7 @@ fn scan_until_found(expected_fullname: &str, expected_port: u16) {
         thread::sleep(Duration::from_millis(250));
     }
 
-    panic!(
-        "did not scan expected host `{expected_fullname}` on port {expected_port} in time"
-    );
+    panic!("did not scan expected host `{expected_fullname}` on port {expected_port} in time");
 }
 
 #[test]

@@ -37,7 +37,10 @@ fn checkout_restores_selected_snapshot_without_moving_head() {
 
     let repo_after_second = syncup::Repository::load(&repo_dir);
     let second_head = repo_after_second.head;
-    assert_ne!(first_head, second_head, "head should move after second snapshot");
+    assert_ne!(
+        first_head, second_head,
+        "head should move after second snapshot"
+    );
     assert_eq!(
         fs::read(repo_dir.join("note.txt")).expect("failed to read working tree file"),
         b"v2\n"
