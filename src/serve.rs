@@ -12,6 +12,7 @@ use std::time::SystemTime;
 use tokio::sync::RwLock;
 
 use crate::protocol::{Request, Response};
+use crate::pull::RequestSender;
 use crate::{Object, ObjectId, Repository, to_hex};
 
 // ── Server / handler boilerplate ─────────────────────────────────────────────
@@ -299,6 +300,16 @@ async fn rpc_via_handle(handle: &Handle, request: &Request) -> Result<Response> 
     Ok(response)
 }
 
+struct HandleRequestSender {
+    handle: Handle,
+}
+
+impl RequestSender for HandleRequestSender {
+    async fn send(&mut self, request: Request) -> Result<Response> {
+        rpc_via_handle(&self.handle, &request).await
+    }
+}
+
 async fn handle_push_by_pulling(
     repo_uuid: [u8; 32],
     handle: Handle,
@@ -308,11 +319,10 @@ async fn handle_push_by_pulling(
     let base = Path::new(".");
 
     info!("push-triggered pull for repo {}", to_hex(&repo_uuid));
-    crate::fetch_and_merge_with(base, None, |req| {
-        let handle = handle.clone();
-        async move { rpc_via_handle(&handle, &req).await }
-    })
-    .await?;
+    let mut sender = HandleRequestSender {
+        handle: handle.clone(),
+    };
+    crate::fetch_and_merge_with(base, None, &mut sender).await?;
     crate::checkout_head(base)?;
     info!(
         "push-triggered pull complete for repo {}",
