@@ -1,6 +1,4 @@
-mod common;
-
-use common::{ChildGuard, bin, free_port, run_ok, unique_temp_dir, wait_for_tcp};
+use crate::common::{ChildGuard, bin, free_port, run_ok, unique_temp_dir, wait_for_tcp};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Read;

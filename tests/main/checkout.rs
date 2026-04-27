@@ -1,6 +1,4 @@
-mod common;
-
-use common::{bin, run_ok, unique_temp_dir};
+use crate::common::{bin, run_ok, unique_temp_dir};
 use std::fs;
 use std::process::Command;
 

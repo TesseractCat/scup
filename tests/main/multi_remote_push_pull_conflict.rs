@@ -1,10 +1,5 @@
-mod common;
-
-#[path = "../src/model.rs"]
-mod model;
-
-use common::{ChildGuard, bin, free_port, run_ok, unique_temp_dir, wait_for_tcp};
-use model::{Blob, List, Map, Object, ObjectId, Repository, to_hex};
+use crate::common::{ChildGuard, bin, free_port, run_ok, unique_temp_dir, wait_for_tcp};
+use syncup::{Blob, List, Map, Object, ObjectId, Repository, to_hex};
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
