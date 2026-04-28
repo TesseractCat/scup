@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{Blob, List, Object, ObjectId, Repository, protocol, scan, to_hex};
+use crate::{Blob, List, Object, ObjectId, Repository, RepositoryId, protocol, scan};
 use anyhow::Context;
 use kdam::{Bar, BarExt};
 use log::{debug, info};
@@ -28,12 +28,11 @@ pub(crate) fn local_pull_response(base: &Path, req: protocol::Request) -> protoc
     let repo = Repository::load(base);
     let repo_uuid = repo.repo_uuid;
 
-    let ensure = |requested: [u8; 32]| -> Result<Repository, String> {
+    let ensure = |requested: RepositoryId| -> Result<Repository, String> {
         if requested != repo_uuid {
             Err(format!(
                 "unknown repo_uuid: requested={}, available={}",
-                to_hex(&requested),
-                to_hex(&repo_uuid)
+                requested, repo_uuid
             ))
         } else {
             Ok(repo.clone())
@@ -56,7 +55,7 @@ pub(crate) fn local_pull_response(base: &Path, req: protocol::Request) -> protoc
                     .collect::<Vec<_>>();
                 debug!(
                     "local pull snapshot ids: head={}, count={}",
-                    to_hex(&repo.head.0),
+                    repo.head.to_hex(),
                     snapshot_ids.len()
                 );
                 protocol::Response::PullSnapshotIds {
@@ -78,7 +77,7 @@ pub(crate) fn local_pull_response(base: &Path, req: protocol::Request) -> protoc
                     if let Some(obj) = repo.objects.get(&id) {
                         objects.push((id, obj.clone()));
                         if matches!(obj, Object::Chunk(_)) {
-                            let path = base.join(format!(".syncup/chunks/{}", to_hex(&id.0)));
+                            let path = base.join(format!(".syncup/chunks/{}", id.to_hex()));
                             if let Ok(bytes) = std::fs::read(path) {
                                 chunks.push((id, bytes));
                             }
@@ -113,7 +112,7 @@ impl RequestSender for ChannelRequestSender<'_> {
 }
 
 async fn fetch_remote_objects<S>(
-    repo_uuid: [u8; 32],
+    repo_uuid: RepositoryId,
     local_object_ids: &BTreeSet<ObjectId>,
     total_objects_hint: Option<usize>,
     max_object_ids_per_pull: usize,
@@ -138,7 +137,7 @@ where
 
     debug!(
         "received snapshot ids: remote_head={}, snapshot_count={}",
-        to_hex(&remote_head.0),
+        remote_head.to_hex(),
         snapshot_ids.len()
     );
 
@@ -272,7 +271,7 @@ where
     let local_object_ids: BTreeSet<ObjectId> = local.objects.keys().copied().collect();
     debug!(
         "starting fetch-and-merge: local_head={}, local_objects={}",
-        to_hex(&local.head.0),
+        local.head.to_hex(),
         local_object_ids.len()
     );
 
@@ -299,7 +298,7 @@ fn merge_fetched_into_local(
 
     std::fs::create_dir_all(base.join(".syncup/chunks")).expect("failed to create .syncup/chunks");
     for (id, data) in fetched_chunks {
-        let path = base.join(format!(".syncup/chunks/{}", to_hex(&id.0)));
+        let path = base.join(format!(".syncup/chunks/{}", id.to_hex()));
         if !path.exists() {
             std::fs::write(path, data).expect("failed to write chunk");
         }
@@ -319,42 +318,6 @@ fn merge_fetched_into_local(
     Ok(())
 }
 
-fn choose_repo(host: &scan::ScannedHost, selector: &str) -> Option<scan::ScannedRepo> {
-    if let Some(repo) = host.repos.iter().find(|repo| repo.root == selector) {
-        return Some(repo.clone());
-    }
-
-    let selector_lc = selector.to_ascii_lowercase();
-    host.repos
-        .iter()
-        .find(|repo| {
-            let id = to_hex(&repo.repo_uuid);
-            id.eq_ignore_ascii_case(&selector_lc) || id.starts_with(&selector_lc)
-        })
-        .cloned()
-}
-
-fn clone_dir_name(repo: &scan::ScannedRepo) -> String {
-    if repo.root.is_empty() || repo.root == "<unknown>" {
-        format!("repo-{}", &to_hex(&repo.repo_uuid)[..8])
-    } else {
-        repo.root.clone()
-    }
-}
-
-fn normalize_repo_path(path: &str) -> Option<PathBuf> {
-    let mut p = path;
-    while let Some(rest) = p.strip_prefix("./") {
-        p = rest;
-    }
-
-    if p.is_empty() || p.starts_with(".syncup/") || p == ".syncup" {
-        return None;
-    }
-
-    Some(PathBuf::from(p))
-}
-
 fn collect_chunk_ids(
     repo: &Repository,
     list_id: ObjectId,
@@ -362,14 +325,14 @@ fn collect_chunk_ids(
 ) -> anyhow::Result<()> {
     let list = match repo.objects.get(&list_id) {
         Some(Object::List(List { entries })) => entries,
-        _ => anyhow::bail!("missing list object {}", to_hex(&list_id.0)),
+        _ => anyhow::bail!("missing list object {}", list_id.to_hex()),
     };
 
     for entry in list {
         match repo.objects.get(entry) {
             Some(Object::Chunk(_)) => out.push(*entry),
             Some(Object::List(_)) => collect_chunk_ids(repo, *entry, out)?,
-            _ => anyhow::bail!("list entry is neither chunk nor list: {}", to_hex(&entry.0)),
+            _ => anyhow::bail!("list entry is neither chunk nor list: {}", entry.to_hex()),
         }
     }
 
@@ -379,7 +342,7 @@ fn collect_chunk_ids(
 fn blob_bytes(repo: &Repository, base: &Path, blob_id: ObjectId) -> anyhow::Result<Vec<u8>> {
     let blob = match repo.objects.get(&blob_id) {
         Some(Object::Blob(Blob { chunks, .. })) => *chunks,
-        _ => anyhow::bail!("missing blob object {}", to_hex(&blob_id.0)),
+        _ => anyhow::bail!("missing blob object {}", blob_id.to_hex()),
     };
 
     let mut chunk_ids = Vec::new();
@@ -387,8 +350,8 @@ fn blob_bytes(repo: &Repository, base: &Path, blob_id: ObjectId) -> anyhow::Resu
 
     let mut out = Vec::new();
     for id in chunk_ids {
-        let bytes = std::fs::read(base.join(format!(".syncup/chunks/{}", to_hex(&id.0))))
-            .with_context(|| format!("missing chunk {}", to_hex(&id.0)))?;
+        let bytes = std::fs::read(base.join(format!(".syncup/chunks/{}", id.to_hex())))
+            .with_context(|| format!("missing chunk {}", id.to_hex()))?;
         out.extend_from_slice(&bytes);
     }
 
@@ -404,7 +367,7 @@ fn checkout_snapshot_from_repo(
         Some(Object::Snapshot(s)) => s,
         _ => anyhow::bail!(
             "requested object is not a snapshot: {}",
-            to_hex(&snapshot_id.0)
+            snapshot_id.to_hex()
         ),
     };
 
@@ -414,11 +377,15 @@ fn checkout_snapshot_from_repo(
     };
 
     for (raw_path, blob_id) in &tree.entries {
-        let Some(rel_path) = normalize_repo_path(raw_path) else {
+        let mut p = raw_path.as_str();
+        while let Some(rest) = p.strip_prefix("./") {
+            p = rest;
+        }
+        if p.is_empty() || p.starts_with(".syncup/") || p == ".syncup" {
             continue;
-        };
+        }
 
-        let full_path = base.join(rel_path);
+        let full_path = base.join(PathBuf::from(p));
         if let Some(parent) = full_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -430,8 +397,8 @@ fn checkout_snapshot_from_repo(
     Ok(())
 }
 
-fn parse_object_id_hex(hex: &str) -> anyhow::Result<ObjectId> {
-    let trimmed = hex.trim();
+pub fn checkout(base: &Path, snapshot_hash: &str) -> anyhow::Result<()> {
+    let trimmed = snapshot_hash.trim();
     if trimmed.len() != 64 {
         anyhow::bail!("snapshot hash must be 64 hex characters");
     }
@@ -441,18 +408,14 @@ fn parse_object_id_hex(hex: &str) -> anyhow::Result<ObjectId> {
         out[i] = u8::from_str_radix(&trimmed[i * 2..i * 2 + 2], 16)
             .map_err(|_| anyhow::anyhow!("invalid snapshot hash: non-hex characters"))?;
     }
-    Ok(ObjectId(out))
-}
-
-pub fn checkout(base: &Path, snapshot_hash: &str) -> anyhow::Result<()> {
-    let snapshot_id = parse_object_id_hex(snapshot_hash)?;
+    let snapshot_id = ObjectId(out);
     let repo = Repository::load(base);
     checkout_snapshot_from_repo(base, &repo, snapshot_id)
 }
 
 pub fn checkout_head(base: &Path) -> anyhow::Result<()> {
     let repo = Repository::load(base);
-    let head_hash = to_hex(&repo.head.0);
+    let head_hash = repo.head.to_hex();
     checkout(base, &head_hash)
 }
 
@@ -462,15 +425,32 @@ pub async fn clone_from_resolved_host(
     repo_selector: &str,
     bare: bool,
 ) -> anyhow::Result<()> {
-    let repo = choose_repo(host, repo_selector).ok_or_else(|| {
-        anyhow::anyhow!(
-            "repo not found on host {} for selector `{}`",
-            host.fullname,
-            repo_selector
-        )
-    })?;
+    let repo = if let Some(repo) = host.repos.iter().find(|repo| repo.root == repo_selector) {
+        repo.clone()
+    } else {
+        let selector_lc = repo_selector.to_ascii_lowercase();
+        host.repos
+            .iter()
+            .find(|repo| {
+                let id = repo.repo_uuid.to_hex();
+                id.eq_ignore_ascii_case(&selector_lc) || id.starts_with(&selector_lc)
+            })
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "repo not found on host {} for selector `{}`",
+                    host.fullname,
+                    repo_selector
+                )
+            })?
+    };
 
-    let dest = base.join(clone_dir_name(&repo));
+    let dest_name = if repo.root.is_empty() || repo.root == "<unknown>" {
+        format!("repo-{}", repo.repo_uuid.to_short_hex())
+    } else {
+        repo.root.clone()
+    };
+    let dest = base.join(dest_name);
     if dest.exists() {
         let mut entries = std::fs::read_dir(&dest)?;
         if entries.next().transpose()?.is_some() {
@@ -486,7 +466,7 @@ pub async fn clone_from_resolved_host(
     info!(
         "cloning repo {} ({}) from {} into {}{}",
         repo.root,
-        to_hex(&repo.repo_uuid),
+        repo.repo_uuid,
         host.fullname,
         dest.display(),
         if bare { " [bare]" } else { "" }
@@ -521,7 +501,7 @@ pub async fn clone_from_resolved_host(
 
     std::fs::create_dir_all(dest.join(".syncup/chunks"))?;
     for (id, data) in fetched_chunks {
-        std::fs::write(dest.join(format!(".syncup/chunks/{}", to_hex(&id.0))), data)?;
+        std::fs::write(dest.join(format!(".syncup/chunks/{}", id.to_hex())), data)?;
     }
 
     let repo_data = Repository {
@@ -532,7 +512,7 @@ pub async fn clone_from_resolved_host(
     repo_data.save(&dest);
 
     if !bare {
-        let head_hash = to_hex(&repo_data.head.0);
+        let head_hash = repo_data.head.to_hex();
         checkout(&dest, &head_hash)?;
     }
 

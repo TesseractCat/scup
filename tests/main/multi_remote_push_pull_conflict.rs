@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-use syncup::{Blob, List, Map, Object, ObjectId, Repository, to_hex};
+use syncup::{Blob, List, Map, Object, ObjectId, Repository};
 
 fn copy_dir_recursive(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).expect("failed to create destination directory");
@@ -91,7 +91,7 @@ fn blob_for_file<'a>(repo: &'a Repository, filename: &str) -> &'a Blob {
 fn collect_chunk_ids(repo: &Repository, list_id: ObjectId, out: &mut Vec<ObjectId>) {
     let list = match repo.objects.get(&list_id) {
         Some(Object::List(List { entries })) => entries,
-        _ => panic!("missing list object: {}", to_hex(&list_id.0)),
+        _ => panic!("missing list object: {}", list_id.to_hex()),
     };
 
     for entry in list {
@@ -110,7 +110,7 @@ fn file_content_from_repo(dir: &Path, repo: &Repository, filename: &str) -> Vec<
 
     let mut out = Vec::new();
     for id in chunk_ids {
-        let path = dir.join(format!(".syncup/chunks/{}", to_hex(&id.0)));
+        let path = dir.join(format!(".syncup/chunks/{}", id.to_hex()));
         let bytes = fs::read(path).expect("failed to read chunk");
         out.extend_from_slice(&bytes);
     }

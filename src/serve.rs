@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 
 use crate::protocol::{Request, Response};
 use crate::pull::RequestSender;
-use crate::{Object, ObjectId, Repository, to_hex};
+use crate::{Object, ObjectId, Repository, RepositoryId};
 
 // ── Server / handler boilerplate ─────────────────────────────────────────────
 
@@ -54,7 +54,7 @@ impl RepoCache {
 
     async fn reload(&self) -> Result<()> {
         let repo = load_repository(&self.base)?;
-        let head = to_hex(&repo.head.0);
+        let head = repo.head.to_hex();
         let object_count = repo.objects.len();
 
         let mut cache = self.cache.write().await;
@@ -109,14 +109,14 @@ impl ServerState {
             .ok_or_else(|| anyhow::anyhow!("no repositories configured on server"))
     }
 
-    async fn ensure_repo(&self, repo_uuid: [u8; 32]) -> Result<(RepoCache, Repository)> {
+    async fn ensure_repo(&self, repo_uuid: RepositoryId) -> Result<(RepoCache, Repository)> {
         let mut available = Vec::new();
 
         for repo_cache in &self.repos {
             let Ok(repo) = repo_cache.repository().await else {
                 continue;
             };
-            available.push(to_hex(&repo.repo_uuid));
+            available.push(repo.repo_uuid.to_string());
             if repo.repo_uuid == repo_uuid {
                 return Ok((repo_cache.clone(), repo));
             }
@@ -128,7 +128,7 @@ impl ServerState {
 
         anyhow::bail!(
             "unknown repo_uuid: requested={}, available={}",
-            to_hex(&repo_uuid),
+            repo_uuid,
             available.join(",")
         );
     }
@@ -160,8 +160,8 @@ impl ServerState {
         })
     }
 
-    async fn handle_pull_snapshot_ids(&self, repo_uuid: [u8; 32]) -> Result<Response> {
-        debug!("serve: pull snapshot ids for repo {}", to_hex(&repo_uuid));
+    async fn handle_pull_snapshot_ids(&self, repo_uuid: RepositoryId) -> Result<Response> {
+        debug!("serve: pull snapshot ids for repo {}", repo_uuid);
         let (_, repo) = self.ensure_repo(repo_uuid).await?;
 
         let snapshot_ids = repo
@@ -175,7 +175,7 @@ impl ServerState {
 
         debug!(
             "serve: snapshot ids response head={}, count={}",
-            to_hex(&repo.head.0),
+            repo.head.to_hex(),
             snapshot_ids.len()
         );
         Ok(Response::PullSnapshotIds {
@@ -186,12 +186,12 @@ impl ServerState {
 
     async fn handle_pull_objects(
         &self,
-        repo_uuid: [u8; 32],
+        repo_uuid: RepositoryId,
         object_ids: &[ObjectId],
     ) -> Result<Response> {
         debug!(
             "serve: pull objects for repo {}, requested={}",
-            to_hex(&repo_uuid),
+            repo_uuid,
             object_ids.len()
         );
         let (repo_cache, repo) = self.ensure_repo(repo_uuid).await?;
@@ -205,9 +205,9 @@ impl ServerState {
                     let data = std::fs::read(
                         repo_cache
                             .base()
-                            .join(format!(".syncup/chunks/{}", to_hex(&id.0))),
+                            .join(format!(".syncup/chunks/{}", id.to_hex())),
                     )
-                    .with_context(|| format!("missing chunk {}", to_hex(&id.0)))?;
+                    .with_context(|| format!("missing chunk {}", id.to_hex()))?;
                     chunks.push((*id, data));
                 }
             }
@@ -223,22 +223,19 @@ impl ServerState {
 
     async fn handle_push_by_pulling(
         &self,
-        repo_uuid: [u8; 32],
+        repo_uuid: RepositoryId,
         handle: Handle,
     ) -> Result<Response> {
         let (repo_cache, _local) = self.ensure_repo(repo_uuid).await?;
         let base = repo_cache.base();
 
-        info!("push-triggered pull for repo {}", to_hex(&repo_uuid));
+        info!("push-triggered pull for repo {}", repo_uuid);
         let mut sender = HandleRequestSender {
             handle: handle.clone(),
         };
         crate::fetch_and_merge_with(base, None, &mut sender).await?;
         crate::checkout_head(base)?;
-        info!(
-            "push-triggered pull complete for repo {}",
-            to_hex(&repo_uuid)
-        );
+        info!("push-triggered pull complete for repo {}", repo_uuid);
 
         if let Err(err) = repo_cache.reload().await {
             warn!("push completed, but failed to refresh in-memory repository cache: {err:#}");
@@ -367,21 +364,17 @@ fn repository_fingerprint(path: &Path) -> Option<(SystemTime, u64)> {
     Some((modified, meta.len()))
 }
 
-async fn rpc_via_handle(handle: &Handle, request: &Request) -> Result<Response> {
-    let mut channel = handle.channel_open_session().await?;
-    let response = crate::rpc(&mut channel, request).await?;
-    let _ = channel.eof().await;
-    let _ = channel.close().await;
-    Ok(response)
-}
-
 struct HandleRequestSender {
     handle: Handle,
 }
 
 impl RequestSender for HandleRequestSender {
     async fn send(&mut self, request: Request) -> Result<Response> {
-        rpc_via_handle(&self.handle, &request).await
+        let mut channel = self.handle.channel_open_session().await?;
+        let response = crate::rpc(&mut channel, &request).await?;
+        let _ = channel.eof().await;
+        let _ = channel.close().await;
+        Ok(response)
     }
 }
 
@@ -410,7 +403,7 @@ const MDNS_SERVICE_TYPE: &str = "_syncup._tcp.local.";
 
 fn advertise_mdns(
     port: u16,
-    repo_uuids: &[[u8; 32]],
+    repo_uuids: &[RepositoryId],
     repo_roots: &[String],
 ) -> Result<ServiceDaemon> {
     let mdns = ServiceDaemon::new().context("failed to start mDNS daemon")?;
@@ -420,7 +413,11 @@ fn advertise_mdns(
     let host_name = format!("{hostname}.local.");
 
     let mut properties = HashMap::new();
-    let repo_list = repo_uuids.iter().map(to_hex).collect::<Vec<_>>().join(",");
+    let repo_list = repo_uuids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     properties.insert("repos".to_string(), repo_list);
     properties.insert("roots".to_string(), repo_roots.join(","));
 
@@ -448,16 +445,6 @@ fn advertise_mdns(
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-fn repo_root_name(base: &Path) -> Option<String> {
-    if base == Path::new(".") {
-        return std::env::current_dir()
-            .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
-    }
-
-    base.file_name().map(|n| n.to_string_lossy().into_owned())
-}
-
 pub async fn serve(port: u16) -> Result<()> {
     let (host_key, allowed_client_key) = load_server_keys()?;
 
@@ -478,8 +465,19 @@ pub async fn serve(port: u16) -> Result<()> {
     for repo_cache in &state.repos {
         if let Some(repo) = repo_cache.maybe_repository().await {
             repo_uuids.push(repo.repo_uuid);
-            repo_roots
-                .push(repo_root_name(repo_cache.base()).unwrap_or_else(|| "<unknown>".to_string()));
+            let root = if repo_cache.base() == Path::new(".") {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| "<unknown>".to_string())
+            } else {
+                repo_cache
+                    .base()
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "<unknown>".to_string())
+            };
+            repo_roots.push(root);
         }
     }
 

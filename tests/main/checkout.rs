@@ -49,7 +49,7 @@ fn checkout_restores_selected_snapshot_without_moving_head() {
             let mut cmd = Command::new(bin());
             cmd.current_dir(&repo_dir)
                 .arg("checkout")
-                .arg(syncup::to_hex(&first_head.0));
+                .arg(first_head.to_hex());
             cmd
         },
         "syncup checkout <first_head>",

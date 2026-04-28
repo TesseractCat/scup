@@ -10,7 +10,9 @@ mod rollsum;
 mod transport;
 
 mod model;
-pub use model::{Blob, Chunk, List, Map, Object, ObjectId, Repository, Snapshot, to_hex};
+pub use model::{
+    Blob, Chunk, List, Map, Object, ObjectId, Repository, RepositoryId, Snapshot, to_hex,
+};
 
 mod protocol;
 mod pull;
@@ -53,7 +55,7 @@ pub async fn debug_status(host_id: &str) -> anyhow::Result<()> {
             info!(
                 "- {} status: head={} objects={}",
                 host.fullname,
-                to_hex(&head.0),
+                head.to_hex(),
                 object_count
             );
         }

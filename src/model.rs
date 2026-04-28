@@ -13,9 +13,19 @@ fn to_short_hex(id: &[u8; 32]) -> String {
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, PartialOrd, Ord, Eq, Hash)]
 pub struct ObjectId(pub [u8; 32]);
 
+impl ObjectId {
+    pub fn to_hex(&self) -> String {
+        to_hex(&self.0)
+    }
+
+    pub fn to_short_hex(&self) -> String {
+        to_short_hex(&self.0)
+    }
+}
+
 impl Debug for ObjectId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", to_short_hex(&self.0))
+        write!(f, "{}", self.to_short_hex())
     }
 }
 
@@ -26,6 +36,56 @@ impl From<[u8; 32]> for ObjectId {
 }
 
 impl AsRef<[u8]> for ObjectId {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, PartialOrd, Ord, Eq, Hash, Default)]
+pub struct RepositoryId(pub [u8; 32]);
+
+impl RepositoryId {
+    pub fn to_hex(&self) -> String {
+        to_hex(&self.0)
+    }
+
+    pub fn to_short_hex(&self) -> String {
+        to_short_hex(&self.0)
+    }
+
+    pub fn from_hex(s: &str) -> Option<Self> {
+        let trimmed = s.trim();
+        if trimmed.len() != 64 {
+            return None;
+        }
+
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            out[i] = u8::from_str_radix(&trimmed[i * 2..i * 2 + 2], 16).ok()?;
+        }
+        Some(Self(out))
+    }
+}
+
+impl Debug for RepositoryId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_short_hex())
+    }
+}
+
+impl std::fmt::Display for RepositoryId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_hex())
+    }
+}
+
+impl From<[u8; 32]> for RepositoryId {
+    fn from(value: [u8; 32]) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<[u8]> for RepositoryId {
     fn as_ref(&self) -> &[u8] {
         &self.0
     }
@@ -87,7 +147,7 @@ pub enum Object {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Repository {
     #[serde(default)]
-    pub repo_uuid: [u8; 32],
+    pub repo_uuid: RepositoryId,
     pub objects: BTreeMap<ObjectId, Object>,
     pub head: ObjectId,
 }

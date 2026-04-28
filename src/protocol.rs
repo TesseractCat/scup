@@ -1,4 +1,4 @@
-use crate::{Object, ObjectId};
+use crate::{Object, ObjectId, RepositoryId};
 use anyhow::{Context, Result};
 use derive_more::Debug;
 use serde::{Deserialize, Serialize};
@@ -10,13 +10,13 @@ pub enum Request {
     Version,
     Status,
     Push {
-        repo_uuid: [u8; 32],
+        repo_uuid: RepositoryId,
     },
     PullSnapshotIds {
-        repo_uuid: [u8; 32],
+        repo_uuid: RepositoryId,
     },
     PullObjects {
-        repo_uuid: [u8; 32],
+        repo_uuid: RepositoryId,
         #[debug(skip)]
         object_ids: Vec<ObjectId>,
     },

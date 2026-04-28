@@ -5,7 +5,7 @@ use rand::RngCore;
 use std::{collections::BTreeMap, path::Path, time::SystemTime};
 
 use crate::chunk::split_chunks;
-use crate::{Blob, Chunk, List, Map, Object, ObjectId, Repository, rollsum, to_hex};
+use crate::{Blob, Chunk, List, Map, Object, ObjectId, Repository, RepositoryId, rollsum};
 
 use super::ids::{blob_object_id, list_object_id, map_object_id, snapshot_object_id};
 
@@ -95,12 +95,12 @@ impl Repository {
         rand::thread_rng().fill_bytes(&mut repo_uuid);
 
         let mut repo = Repository {
-            repo_uuid,
+            repo_uuid: RepositoryId(repo_uuid),
             objects: BTreeMap::new(),
             head: ObjectId([0u8; 32]),
         };
         repo.snapshot(base, Some("Initial snapshot".to_string()));
-        info!("Repository UUID: {}", to_hex(&repo.repo_uuid));
+        info!("Repository UUID: {}", repo.repo_uuid);
         repo
     }
 
@@ -171,11 +171,8 @@ impl Repository {
                     chunk.unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
                 chunk_leaves.push((id, digest));
                 self.objects.entry(id).or_insert_with(|| {
-                    std::fs::write(
-                        base.join(format!(".syncup/chunks/{}", to_hex(&id.0))),
-                        &data,
-                    )
-                    .expect("failed to write chunk");
+                    std::fs::write(base.join(format!(".syncup/chunks/{}", id.to_hex())), &data)
+                        .expect("failed to write chunk");
                     Object::Chunk(Chunk)
                 });
             }
@@ -217,7 +214,7 @@ impl Repository {
         self.objects.insert(sid, Object::Snapshot(snap));
         self.head = sid;
 
-        info!("Snapshot: {}", to_hex(&sid.0));
+        info!("Snapshot: {}", sid.to_hex());
         self.save(base);
     }
 }

@@ -1,64 +1,50 @@
 use anyhow::{Context, Result, anyhow};
 use log::{debug, info};
-use mdns_sd::{ServiceDaemon, ServiceEvent};
+use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use crate::to_hex;
+use crate::RepositoryId;
 
 const MDNS_SERVICE_TYPE: &str = "_syncup._tcp.local.";
 
-fn parse_repo_list(value: Option<&str>) -> Vec<[u8; 32]> {
-    fn from_hex_32(s: &str) -> Option<[u8; 32]> {
-        if s.len() != 64 {
-            return None;
-        }
-        let mut out = [0u8; 32];
-        for i in 0..32 {
-            let b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
-            out[i] = b;
-        }
-        Some(out)
-    }
-
-    value
-        .unwrap_or("")
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter_map(from_hex_32)
-        .collect()
-}
-
-fn parse_string_list(value: Option<&str>) -> Vec<String> {
-    value
-        .unwrap_or("")
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
 #[derive(Clone, Debug)]
 pub struct ScannedRepo {
-    pub repo_uuid: [u8; 32],
+    pub repo_uuid: RepositoryId,
     pub root: String,
 }
 
-fn combine_repos(repo_uuids: Vec<[u8; 32]>, repo_roots: Vec<String>) -> Vec<ScannedRepo> {
-    repo_uuids
-        .into_iter()
-        .enumerate()
-        .map(|(i, repo_uuid)| ScannedRepo {
-            repo_uuid,
-            root: repo_roots
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| "<unknown>".to_string()),
-        })
-        .collect()
+impl ScannedRepo {
+    fn from_properties(repos: Option<&str>, roots: Option<&str>) -> Vec<Self> {
+        let repo_ids = repos
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter_map(RepositoryId::from_hex)
+            .collect::<Vec<_>>();
+
+        let repo_roots = roots
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+
+        repo_ids
+            .into_iter()
+            .enumerate()
+            .map(|(i, repo_uuid)| ScannedRepo {
+                repo_uuid,
+                root: repo_roots
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| "<unknown>".to_string()),
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +53,29 @@ pub struct ScannedHost {
     pub addrs: Vec<IpAddr>,
     pub port: u16,
     pub repos: Vec<ScannedRepo>,
+}
+
+impl ScannedHost {
+    fn from_resolved_info(info: &ResolvedService) -> Self {
+        let mut addrs: Vec<_> = info
+            .get_addresses()
+            .iter()
+            .map(|ip| ip.to_ip_addr())
+            .collect();
+        addrs.sort();
+
+        let repos = ScannedRepo::from_properties(
+            info.get_property_val_str("repos"),
+            info.get_property_val_str("roots"),
+        );
+
+        Self {
+            fullname: info.get_fullname().to_string(),
+            addrs,
+            port: info.get_port(),
+            repos,
+        }
+    }
 }
 
 pub fn scan_hosts(timeout_secs: u64) -> Result<Vec<ScannedHost>> {
@@ -91,26 +100,8 @@ pub fn scan_hosts(timeout_secs: u64) -> Result<Vec<ScannedHost>> {
         };
 
         if let ServiceEvent::ServiceResolved(info) = event {
-            let fullname = info.get_fullname().to_string();
-            if seen.insert(fullname.clone()) {
-                let mut addrs: Vec<_> = info
-                    .get_addresses()
-                    .iter()
-                    .map(|ip| ip.to_ip_addr())
-                    .collect();
-                addrs.sort();
-
-                let repos = combine_repos(
-                    parse_repo_list(info.get_property_val_str("repos")),
-                    parse_string_list(info.get_property_val_str("roots")),
-                );
-
-                let host = ScannedHost {
-                    fullname,
-                    addrs,
-                    port: info.get_port(),
-                    repos,
-                };
+            let host = ScannedHost::from_resolved_info(&info);
+            if seen.insert(host.fullname.clone()) {
                 debug!(
                     "resolved host {}:{} repos={}",
                     host.fullname,
@@ -146,7 +137,7 @@ pub fn scan(timeout_secs: u64) -> Result<()> {
         } else {
             host.repos
                 .iter()
-                .map(|repo| format!("{}:{}", to_hex(&repo.repo_uuid), repo.root))
+                .map(|repo| format!("{}:{}", repo.repo_uuid, repo.root))
                 .collect::<Vec<_>>()
                 .join(",")
         };
@@ -183,27 +174,8 @@ pub fn resolve_host(host_id: &str, timeout_secs: u64) -> Result<ScannedHost> {
         };
 
         if let ServiceEvent::ServiceResolved(info) = event {
-            let fullname = info.get_fullname().to_string();
-            if fullname == host_id {
-                let mut addrs: Vec<_> = info
-                    .get_addresses()
-                    .iter()
-                    .map(|ip| ip.to_ip_addr())
-                    .collect();
-                addrs.sort();
-
-                let repos = combine_repos(
-                    parse_repo_list(info.get_property_val_str("repos")),
-                    parse_string_list(info.get_property_val_str("roots")),
-                );
-
-                let host = ScannedHost {
-                    fullname,
-                    addrs,
-                    port: info.get_port(),
-                    repos,
-                };
-
+            let host = ScannedHost::from_resolved_info(&info);
+            if host.fullname == host_id {
                 let _ = mdns.stop_browse(MDNS_SERVICE_TYPE);
                 mdns.shutdown().context("failed to shutdown mDNS daemon")?;
                 return Ok(host);

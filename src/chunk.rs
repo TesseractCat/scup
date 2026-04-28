@@ -85,7 +85,7 @@ pub(crate) fn split_chunks<R: Read>(reader: R) -> ChunkReader<R> {
     }
 }
 
-fn chunk_file(path: &Path) {
+pub(crate) fn debug_chunk_file(path: &Path) {
     let file = std::fs::File::open(path).expect("failed to open file");
     let mut offset = 0usize;
 
@@ -102,8 +102,4 @@ fn chunk_file(path: &Path) {
         //println!("chunk [{offset}, {end}), len={}", data.len());
         offset = end;
     }
-}
-
-pub(crate) fn debug_chunk_file(path: &Path) {
-    chunk_file(path);
 }
