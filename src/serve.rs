@@ -17,8 +17,239 @@ use crate::{Object, ObjectId, Repository, to_hex};
 
 // ── Server / handler boilerplate ─────────────────────────────────────────────
 
+#[derive(Clone)]
+struct RepoCache {
+    base: PathBuf,
+    cache: Arc<RwLock<Option<Repository>>>,
+}
+
+impl RepoCache {
+    fn new(base: PathBuf) -> Self {
+        let initial_repo = load_repository(&base).ok();
+        Self {
+            base,
+            cache: Arc::new(RwLock::new(initial_repo)),
+        }
+    }
+
+    fn base(&self) -> &Path {
+        &self.base
+    }
+
+    fn repository_path(&self) -> PathBuf {
+        self.base.join(".syncup/repository")
+    }
+
+    async fn maybe_repository(&self) -> Option<Repository> {
+        self.cache.read().await.clone()
+    }
+
+    async fn repository(&self) -> Result<Repository> {
+        self.cache
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("repository not found — run `syncup init` first"))
+    }
+
+    async fn reload(&self) -> Result<()> {
+        let repo = load_repository(&self.base)?;
+        let head = to_hex(&repo.head.0);
+        let object_count = repo.objects.len();
+
+        let mut cache = self.cache.write().await;
+        *cache = Some(repo);
+
+        info!("repository cache reloaded: head={head}, objects={object_count}");
+        Ok(())
+    }
+
+    async fn watch_repository_file(self) {
+        let repo_path = self.repository_path();
+        let mut last_seen = repository_fingerprint(&repo_path);
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+            let current = repository_fingerprint(&repo_path);
+            if current == last_seen {
+                continue;
+            }
+            last_seen = current;
+
+            match self.reload().await {
+                Ok(()) => {
+                    info!("detected repository file change: {}", repo_path.display());
+                }
+                Err(err) => {
+                    warn!(
+                        "failed to reload repository after change {}: {err:#}",
+                        repo_path.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ServerState {
+    repos: Vec<RepoCache>,
+}
+
+impl ServerState {
+    fn new(repos: Vec<RepoCache>) -> Self {
+        Self { repos }
+    }
+
+    fn first_repo(&self) -> Result<RepoCache> {
+        self.repos
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no repositories configured on server"))
+    }
+
+    async fn ensure_repo(&self, repo_uuid: [u8; 32]) -> Result<(RepoCache, Repository)> {
+        let mut available = Vec::new();
+
+        for repo_cache in &self.repos {
+            let Ok(repo) = repo_cache.repository().await else {
+                continue;
+            };
+            available.push(to_hex(&repo.repo_uuid));
+            if repo.repo_uuid == repo_uuid {
+                return Ok((repo_cache.clone(), repo));
+            }
+        }
+
+        if available.is_empty() {
+            anyhow::bail!("repository not found - run `syncup init` first");
+        }
+
+        anyhow::bail!(
+            "unknown repo_uuid: requested={}, available={}",
+            to_hex(&repo_uuid),
+            available.join(",")
+        );
+    }
+
+    async fn handle_request(&self, request: Request, handle: Handle) -> Response {
+        info!("request: {request:?}");
+        match request {
+            Request::Version => Ok(Response::Version {
+                version: crate::protocol::PROTOCOL_VERSION,
+            }),
+            Request::Status => self.handle_status().await,
+            Request::Push { repo_uuid } => self.handle_push_by_pulling(repo_uuid, handle).await,
+            Request::PullSnapshotIds { repo_uuid } => {
+                self.handle_pull_snapshot_ids(repo_uuid).await
+            }
+            Request::PullObjects {
+                repo_uuid,
+                object_ids,
+            } => self.handle_pull_objects(repo_uuid, &object_ids).await,
+        }
+        .unwrap_or_else(|e| Response::Error(e.to_string()))
+    }
+
+    async fn handle_status(&self) -> Result<Response> {
+        let repo = self.first_repo()?.repository().await?;
+        Ok(Response::Status {
+            head: repo.head,
+            object_count: repo.objects.len(),
+        })
+    }
+
+    async fn handle_pull_snapshot_ids(&self, repo_uuid: [u8; 32]) -> Result<Response> {
+        debug!("serve: pull snapshot ids for repo {}", to_hex(&repo_uuid));
+        let (_, repo) = self.ensure_repo(repo_uuid).await?;
+
+        let snapshot_ids = repo
+            .objects
+            .iter()
+            .filter_map(|(id, obj)| match obj {
+                Object::Snapshot(_) => Some(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        debug!(
+            "serve: snapshot ids response head={}, count={}",
+            to_hex(&repo.head.0),
+            snapshot_ids.len()
+        );
+        Ok(Response::PullSnapshotIds {
+            head: repo.head,
+            snapshot_ids,
+        })
+    }
+
+    async fn handle_pull_objects(
+        &self,
+        repo_uuid: [u8; 32],
+        object_ids: &[ObjectId],
+    ) -> Result<Response> {
+        debug!(
+            "serve: pull objects for repo {}, requested={}",
+            to_hex(&repo_uuid),
+            object_ids.len()
+        );
+        let (repo_cache, repo) = self.ensure_repo(repo_uuid).await?;
+        let mut objects = Vec::new();
+        let mut chunks = Vec::new();
+
+        for id in object_ids {
+            if let Some(obj) = repo.objects.get(id) {
+                objects.push((*id, obj.clone()));
+                if matches!(obj, Object::Chunk(_)) {
+                    let data = std::fs::read(
+                        repo_cache
+                            .base()
+                            .join(format!(".syncup/chunks/{}", to_hex(&id.0))),
+                    )
+                    .with_context(|| format!("missing chunk {}", to_hex(&id.0)))?;
+                    chunks.push((*id, data));
+                }
+            }
+        }
+
+        debug!(
+            "serve: pull objects response objects={}, chunks={}",
+            objects.len(),
+            chunks.len()
+        );
+        Ok(Response::PullObjects { objects, chunks })
+    }
+
+    async fn handle_push_by_pulling(
+        &self,
+        repo_uuid: [u8; 32],
+        handle: Handle,
+    ) -> Result<Response> {
+        let (repo_cache, _local) = self.ensure_repo(repo_uuid).await?;
+        let base = repo_cache.base();
+
+        info!("push-triggered pull for repo {}", to_hex(&repo_uuid));
+        let mut sender = HandleRequestSender {
+            handle: handle.clone(),
+        };
+        crate::fetch_and_merge_with(base, None, &mut sender).await?;
+        crate::checkout_head(base)?;
+        info!(
+            "push-triggered pull complete for repo {}",
+            to_hex(&repo_uuid)
+        );
+
+        if let Err(err) = repo_cache.reload().await {
+            warn!("push completed, but failed to refresh in-memory repository cache: {err:#}");
+        }
+
+        Ok(Response::PushComplete)
+    }
+}
+
 struct SyncupServer {
-    repo_cache: Arc<RwLock<Option<Repository>>>,
+    state: ServerState,
     allowed_client_key: Option<russh_keys::key::PublicKey>,
 }
 
@@ -28,7 +259,7 @@ impl Server for SyncupServer {
     fn new_client(&mut self, _addr: Option<std::net::SocketAddr>) -> Self::Handler {
         ConnectionHandler {
             pending_request: Vec::new(),
-            repo_cache: self.repo_cache.clone(),
+            state: self.state.clone(),
             allowed_client_key: self.allowed_client_key.clone(),
         }
     }
@@ -37,7 +268,7 @@ impl Server for SyncupServer {
 /// Per-connection state for a single request/response exchange.
 struct ConnectionHandler {
     pending_request: Vec<u8>,
-    repo_cache: Arc<RwLock<Option<Repository>>>,
+    state: ServerState,
     allowed_client_key: Option<russh_keys::key::PublicKey>,
 }
 
@@ -76,11 +307,11 @@ impl Handler for ConnectionHandler {
         debug!("buffered {} bytes of request payload", data.len());
 
         while let Some(frame) = crate::protocol::pop_framed_message(&mut self.pending_request) {
-            let repo_cache = self.repo_cache.clone();
+            let state = self.state.clone();
             let handle = session.handle();
             tokio::spawn(async move {
                 let response = match crate::protocol::decode_request(&frame) {
-                    Ok(request) => dispatch_request(request, &repo_cache, handle.clone()).await,
+                    Ok(request) => state.handle_request(request, handle.clone()).await,
                     Err(err) => Response::Error(err.to_string()),
                 };
                 let _ = send_response_frame(channel, handle, &response).await;
@@ -124,175 +355,16 @@ async fn send_response_frame(
     Ok(())
 }
 
-async fn dispatch_request(
-    request: Request,
-    repo_cache: &Arc<RwLock<Option<Repository>>>,
-    handle: Handle,
-) -> Response {
-    info!("request: {request:?}");
-    match request {
-        Request::Version => Ok(Response::Version {
-            version: crate::protocol::PROTOCOL_VERSION,
-        }),
-        Request::Status => handle_status(repo_cache).await,
-        Request::Push { repo_uuid } => {
-            handle_push_by_pulling(repo_uuid, handle, repo_cache.clone()).await
-        }
-        Request::PullSnapshotIds { repo_uuid } => {
-            handle_pull_snapshot_ids(repo_uuid, repo_cache).await
-        }
-        Request::PullObjects {
-            repo_uuid,
-            object_ids,
-        } => handle_pull_objects(repo_uuid, &object_ids, repo_cache).await,
-    }
-    .unwrap_or_else(|e| Response::Error(e.to_string()))
-}
-
 fn load_repository(base: &Path) -> Result<Repository> {
     let bytes = std::fs::read(base.join(".syncup/repository"))
         .context("repository not found — run `syncup init` first")?;
     Ok(postcard::from_bytes(&bytes)?)
 }
 
-async fn reload_repository_cache(
-    base: &Path,
-    repo_cache: &Arc<RwLock<Option<Repository>>>,
-) -> Result<()> {
-    let repo = load_repository(base)?;
-    let head = to_hex(&repo.head.0);
-    let object_count = repo.objects.len();
-
-    let mut cache = repo_cache.write().await;
-    *cache = Some(repo);
-
-    info!("repository cache reloaded: head={head}, objects={object_count}");
-    Ok(())
-}
-
-async fn repository_from_cache(repo_cache: &Arc<RwLock<Option<Repository>>>) -> Result<Repository> {
-    repo_cache
-        .read()
-        .await
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("repository not found — run `syncup init` first"))
-}
-
 fn repository_fingerprint(path: &Path) -> Option<(SystemTime, u64)> {
     let meta = std::fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;
     Some((modified, meta.len()))
-}
-
-async fn watch_repository_file(base: PathBuf, repo_cache: Arc<RwLock<Option<Repository>>>) {
-    let repo_path = base.join(".syncup/repository");
-    let mut last_seen = repository_fingerprint(&repo_path);
-
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-        let current = repository_fingerprint(&repo_path);
-        if current == last_seen {
-            continue;
-        }
-        last_seen = current;
-
-        match reload_repository_cache(&base, &repo_cache).await {
-            Ok(()) => {
-                info!("detected repository file change: {}", repo_path.display());
-            }
-            Err(err) => {
-                warn!(
-                    "failed to reload repository after change {}: {err:#}",
-                    repo_path.display()
-                );
-            }
-        }
-    }
-}
-
-// ── Request handlers ──────────────────────────────────────────────────────────
-
-async fn handle_status(repo_cache: &Arc<RwLock<Option<Repository>>>) -> Result<Response> {
-    let repo = repository_from_cache(repo_cache).await?;
-    Ok(Response::Status {
-        head: repo.head,
-        object_count: repo.objects.len(),
-    })
-}
-
-async fn ensure_repo(
-    repo_uuid: [u8; 32],
-    repo_cache: &Arc<RwLock<Option<Repository>>>,
-) -> Result<Repository> {
-    let repo = repository_from_cache(repo_cache).await?;
-    if repo.repo_uuid != repo_uuid {
-        anyhow::bail!(
-            "unknown repo_uuid: requested={}, available={}",
-            to_hex(&repo_uuid),
-            to_hex(&repo.repo_uuid)
-        );
-    }
-    Ok(repo)
-}
-
-async fn handle_pull_snapshot_ids(
-    repo_uuid: [u8; 32],
-    repo_cache: &Arc<RwLock<Option<Repository>>>,
-) -> Result<Response> {
-    debug!("serve: pull snapshot ids for repo {}", to_hex(&repo_uuid));
-    let repo = ensure_repo(repo_uuid, repo_cache).await?;
-    let snapshot_ids = repo
-        .objects
-        .iter()
-        .filter_map(|(id, obj)| match obj {
-            Object::Snapshot(_) => Some(*id),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    debug!(
-        "serve: snapshot ids response head={}, count={}",
-        to_hex(&repo.head.0),
-        snapshot_ids.len()
-    );
-    Ok(Response::PullSnapshotIds {
-        head: repo.head,
-        snapshot_ids,
-    })
-}
-
-async fn handle_pull_objects(
-    repo_uuid: [u8; 32],
-    object_ids: &[ObjectId],
-    repo_cache: &Arc<RwLock<Option<Repository>>>,
-) -> Result<Response> {
-    debug!(
-        "serve: pull objects for repo {}, requested={}",
-        to_hex(&repo_uuid),
-        object_ids.len()
-    );
-    let repo = ensure_repo(repo_uuid, repo_cache).await?;
-    let mut objects = Vec::new();
-    let mut chunks = Vec::new();
-
-    for id in object_ids {
-        if let Some(obj) = repo.objects.get(id) {
-            objects.push((*id, obj.clone()));
-            if matches!(obj, Object::Chunk(_)) {
-                let data = std::fs::read(format!(".syncup/chunks/{}", to_hex(&id.0)))
-                    .with_context(|| format!("missing chunk {}", to_hex(&id.0)))?;
-                chunks.push((*id, data));
-            }
-        }
-    }
-
-    debug!(
-        "serve: pull objects response objects={}, chunks={}",
-        objects.len(),
-        chunks.len()
-    );
-    Ok(Response::PullObjects { objects, chunks })
 }
 
 async fn rpc_via_handle(handle: &Handle, request: &Request) -> Result<Response> {
@@ -311,32 +383,6 @@ impl RequestSender for HandleRequestSender {
     async fn send(&mut self, request: Request) -> Result<Response> {
         rpc_via_handle(&self.handle, &request).await
     }
-}
-
-async fn handle_push_by_pulling(
-    repo_uuid: [u8; 32],
-    handle: Handle,
-    repo_cache: Arc<RwLock<Option<Repository>>>,
-) -> Result<Response> {
-    let _local = ensure_repo(repo_uuid, &repo_cache).await?;
-    let base = Path::new(".");
-
-    info!("push-triggered pull for repo {}", to_hex(&repo_uuid));
-    let mut sender = HandleRequestSender {
-        handle: handle.clone(),
-    };
-    crate::fetch_and_merge_with(base, None, &mut sender).await?;
-    crate::checkout_head(base)?;
-    info!(
-        "push-triggered pull complete for repo {}",
-        to_hex(&repo_uuid)
-    );
-
-    if let Err(err) = reload_repository_cache(base, &repo_cache).await {
-        warn!("push completed, but failed to refresh in-memory repository cache: {err:#}");
-    }
-
-    Ok(Response::PushComplete)
 }
 
 // ── Key loading ───────────────────────────────────────────────────────────────
@@ -374,11 +420,7 @@ fn advertise_mdns(
     let host_name = format!("{hostname}.local.");
 
     let mut properties = HashMap::new();
-    let repo_list = repo_uuids
-        .iter()
-        .map(|id| to_hex(id))
-        .collect::<Vec<_>>()
-        .join(",");
+    let repo_list = repo_uuids.iter().map(to_hex).collect::<Vec<_>>().join(",");
     properties.insert("repos".to_string(), repo_list);
     properties.insert("roots".to_string(), repo_roots.join(","));
 
@@ -406,10 +448,14 @@ fn advertise_mdns(
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-fn current_repo_root_name() -> Option<String> {
-    std::env::current_dir()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+fn repo_root_name(base: &Path) -> Option<String> {
+    if base == Path::new(".") {
+        return std::env::current_dir()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+    }
+
+    base.file_name().map(|n| n.to_string_lossy().into_owned())
 }
 
 pub async fn serve(port: u16) -> Result<()> {
@@ -422,21 +468,20 @@ pub async fn serve(port: u16) -> Result<()> {
         ..Default::default()
     });
 
-    let base = PathBuf::from(".");
-    let initial_repo = load_repository(&base).ok();
-    let repo_cache = Arc::new(RwLock::new(initial_repo.clone()));
+    let repo_cache = RepoCache::new(PathBuf::from("."));
+    tokio::spawn(repo_cache.clone().watch_repository_file());
 
-    tokio::spawn(watch_repository_file(base.clone(), repo_cache.clone()));
+    let state = ServerState::new(vec![repo_cache]);
 
-    let repo_uuids = initial_repo
-        .as_ref()
-        .map(|r| vec![r.repo_uuid])
-        .unwrap_or_else(Vec::new);
-    let repo_roots = if repo_uuids.is_empty() {
-        Vec::new()
-    } else {
-        vec![current_repo_root_name().unwrap_or_else(|| "<unknown>".to_string())]
-    };
+    let mut repo_uuids = Vec::new();
+    let mut repo_roots = Vec::new();
+    for repo_cache in &state.repos {
+        if let Some(repo) = repo_cache.maybe_repository().await {
+            repo_uuids.push(repo.repo_uuid);
+            repo_roots
+                .push(repo_root_name(repo_cache.base()).unwrap_or_else(|| "<unknown>".to_string()));
+        }
+    }
 
     let _mdns = advertise_mdns(port, &repo_uuids, &repo_roots)?;
 
@@ -444,7 +489,7 @@ pub async fn serve(port: u16) -> Result<()> {
     info!("Listening on 0.0.0.0:{port}");
 
     let mut server = SyncupServer {
-        repo_cache,
+        state,
         allowed_client_key,
     };
     loop {

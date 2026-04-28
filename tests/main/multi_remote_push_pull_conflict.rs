@@ -1,10 +1,10 @@
 use crate::common::{ChildGuard, bin, free_port, run_ok, unique_temp_dir, wait_for_tcp};
-use syncup::{Blob, List, Map, Object, ObjectId, Repository, to_hex};
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use syncup::{Blob, List, Map, Object, ObjectId, Repository, to_hex};
 
 fn copy_dir_recursive(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).expect("failed to create destination directory");
