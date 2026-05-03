@@ -1,12 +1,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use crate::{Blob, List, Object, ObjectId, Repository, RepositoryId, protocol, scan};
 use anyhow::Context;
 use kdam::{Bar, BarExt};
 use log::{debug, info};
+use relative_path::{Component as RelativeComponent, RelativePath};
 
 pub(crate) fn object_refs(obj: &Object) -> Vec<ObjectId> {
     match obj {
@@ -358,6 +359,78 @@ fn blob_bytes(repo: &Repository, base: &Path, blob_id: ObjectId) -> anyhow::Resu
     Ok(out)
 }
 
+fn normalized_repo_path(raw_path: &str) -> Option<String> {
+    let normalized = RelativePath::new(raw_path).normalize().into_string();
+    if normalized.is_empty() || normalized == "." {
+        return None;
+    }
+
+    if RelativePath::new(&normalized)
+        .components()
+        .any(|c| matches!(c, RelativeComponent::ParentDir))
+    {
+        return None;
+    }
+
+    if normalized == ".syncup" || normalized.starts_with(".syncup/") {
+        return None;
+    }
+
+    Some(normalized)
+}
+
+fn snapshot_file_paths(
+    repo: &Repository,
+    snapshot_id: ObjectId,
+) -> anyhow::Result<BTreeSet<String>> {
+    let snap = match repo.objects.get(&snapshot_id) {
+        Some(Object::Snapshot(s)) => s,
+        _ => anyhow::bail!(
+            "requested object is not a snapshot: {}",
+            snapshot_id.to_hex()
+        ),
+    };
+
+    let tree = match repo.objects.get(&snap.tree) {
+        Some(Object::Map(m)) => m,
+        _ => anyhow::bail!("snapshot tree is not a map"),
+    };
+
+    let mut paths = BTreeSet::new();
+    for raw_path in tree.entries.keys() {
+        if let Some(rel) = normalized_repo_path(raw_path) {
+            paths.insert(rel);
+        }
+    }
+
+    Ok(paths)
+}
+
+fn remove_file_and_empty_parents(base: &Path, rel_path: &str) -> anyhow::Result<()> {
+    let full_path = RelativePath::new(rel_path).to_path(base);
+    if let Ok(meta) = std::fs::symlink_metadata(&full_path) {
+        if meta.file_type().is_file() || meta.file_type().is_symlink() {
+            std::fs::remove_file(&full_path)?;
+        }
+    }
+
+    let mut current = full_path.parent();
+    while let Some(dir) = current {
+        if dir == base {
+            break;
+        }
+
+        match std::fs::remove_dir(dir) {
+            Ok(()) => current = dir.parent(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => current = dir.parent(),
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+            Err(_) => break,
+        }
+    }
+
+    Ok(())
+}
+
 fn checkout_snapshot_from_repo(
     base: &Path,
     repo: &Repository,
@@ -377,15 +450,11 @@ fn checkout_snapshot_from_repo(
     };
 
     for (raw_path, blob_id) in &tree.entries {
-        let mut p = raw_path.as_str();
-        while let Some(rest) = p.strip_prefix("./") {
-            p = rest;
-        }
-        if p.is_empty() || p.starts_with(".syncup/") || p == ".syncup" {
+        let Some(rel_path) = normalized_repo_path(raw_path) else {
             continue;
-        }
+        };
 
-        let full_path = base.join(PathBuf::from(p));
+        let full_path = RelativePath::new(&rel_path).to_path(base);
         if let Some(parent) = full_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -409,8 +478,19 @@ pub fn checkout(base: &Path, snapshot_hash: &str) -> anyhow::Result<()> {
             .map_err(|_| anyhow::anyhow!("invalid snapshot hash: non-hex characters"))?;
     }
     let snapshot_id = ObjectId(out);
-    let repo = Repository::load(base);
-    checkout_snapshot_from_repo(base, &repo, snapshot_id)
+
+    let mut repo = Repository::load(base);
+    let previous_paths = snapshot_file_paths(&repo, repo.head)?;
+    let target_paths = snapshot_file_paths(&repo, snapshot_id)?;
+
+    for rel_path in previous_paths.difference(&target_paths) {
+        remove_file_and_empty_parents(base, rel_path)?;
+    }
+
+    checkout_snapshot_from_repo(base, &repo, snapshot_id)?;
+    repo.head = snapshot_id;
+    repo.save(base);
+    Ok(())
 }
 
 pub fn checkout_head(base: &Path) -> anyhow::Result<()> {
@@ -526,7 +606,7 @@ pub async fn clone_from_resolved_host(
 
 pub async fn fetch_all(base: &Path) -> anyhow::Result<()> {
     let local = Repository::load(base);
-    let hosts = scan::scan_hosts(3)?;
+    let hosts = scan::scan_hosts(5)?;
 
     for host in hosts {
         if !host

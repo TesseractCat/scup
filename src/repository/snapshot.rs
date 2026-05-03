@@ -2,6 +2,7 @@ use ignore::Walk;
 use kdam::tqdm;
 use log::info;
 use rand::RngCore;
+use relative_path::RelativePath;
 use std::{collections::BTreeMap, path::Path, time::SystemTime};
 
 use crate::chunk::split_chunks;
@@ -141,7 +142,18 @@ impl Repository {
 
         for entry in tqdm!(entries.iter(), desc = "Processing files", position = 0) {
             let path = entry.path();
-            let rel_path = path.to_string_lossy().into_owned();
+            let Some(rel) = path.strip_prefix(base).ok() else {
+                continue;
+            };
+            let Some(rel_path) = RelativePath::from_path(rel)
+                .ok()
+                .map(|p| p.normalize().into_string())
+            else {
+                continue;
+            };
+            if rel_path == ".syncup" || rel_path.starts_with(".syncup/") {
+                continue;
+            }
 
             let metadata =
                 std::fs::metadata(path).unwrap_or_else(|_| panic!("failed to stat {path:?}"));

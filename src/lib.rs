@@ -72,7 +72,7 @@ pub async fn debug_status(host_id: &str) -> anyhow::Result<()> {
 
 pub async fn push_all(base: &Path) -> anyhow::Result<()> {
     let local = Repository::load(base);
-    let hosts = scan::scan_hosts(3)?;
+    let hosts = scan::scan_hosts(5)?;
 
     for host in hosts {
         if !host
