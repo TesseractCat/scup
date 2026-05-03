@@ -3,8 +3,9 @@ use std::{
     path::Path,
 };
 
-use crate::{Blob, List, Object, ObjectId, Repository, RepositoryId, protocol, scan};
-use anyhow::Context;
+use crate::{
+    Blob, List, Object, ObjectId, Repository, RepositoryId, RepositorySession, protocol, scan,
+};
 use kdam::{Bar, BarExt};
 use log::{debug, info};
 use relative_path::{Component as RelativeComponent, RelativePath};
@@ -26,7 +27,11 @@ pub(crate) fn object_refs(obj: &Object) -> Vec<ObjectId> {
 
 pub(crate) fn local_pull_response(base: &Path, req: protocol::Request) -> protocol::Response {
     debug!("handling local pull request from {:?}: {:?}", base, req);
-    let repo = Repository::load(base);
+    let session = match RepositorySession::load(base) {
+        Ok(s) => s,
+        Err(err) => return protocol::Response::Error(err.to_string()),
+    };
+    let repo = session.repository.clone();
     let repo_uuid = repo.repo_uuid;
 
     let ensure = |requested: RepositoryId| -> Result<Repository, String> {
@@ -78,8 +83,7 @@ pub(crate) fn local_pull_response(base: &Path, req: protocol::Request) -> protoc
                     if let Some(obj) = repo.objects.get(&id) {
                         objects.push((id, obj.clone()));
                         if matches!(obj, Object::Chunk(_)) {
-                            let path = base.join(format!("{}/{}", crate::CHUNKS_DIR, id.to_hex()));
-                            if let Ok(bytes) = std::fs::read(path) {
+                            if let Ok(bytes) = session.chunk_storage.read_chunk(id) {
                                 chunks.push((id, bytes));
                             }
                         }
@@ -234,14 +238,14 @@ pub(crate) async fn fetch_and_merge_from_host(
         _ => None,
     };
 
-    let local = Repository::load(base);
-    let local_object_ids: BTreeSet<ObjectId> = local.objects.keys().copied().collect();
+    let mut local = RepositorySession::load(base)?;
+    let local_object_ids: BTreeSet<ObjectId> = local.repository.objects.keys().copied().collect();
 
     let mut sender = ChannelRequestSender {
         channel: &mut channel,
     };
     let (remote_head, fetched_objects, fetched_chunks) = fetch_remote_objects(
-        local.repo_uuid,
+        local.repository.repo_uuid,
         &local_object_ids,
         total_objects_hint,
         2048,
@@ -249,7 +253,7 @@ pub(crate) async fn fetch_and_merge_from_host(
     )
     .await?;
 
-    merge_fetched_into_local(base, remote_head, fetched_objects, fetched_chunks)?;
+    merge_fetched_into_local(&mut local, remote_head, fetched_objects, fetched_chunks)?;
 
     let _ = channel.eof().await;
     let _ = channel.close().await;
@@ -268,16 +272,16 @@ pub(crate) async fn fetch_and_merge_with<S>(
 where
     S: RequestSender,
 {
-    let local = Repository::load(base);
-    let local_object_ids: BTreeSet<ObjectId> = local.objects.keys().copied().collect();
+    let mut local = RepositorySession::load(base)?;
+    let local_object_ids: BTreeSet<ObjectId> = local.repository.objects.keys().copied().collect();
     debug!(
         "starting fetch-and-merge: local_head={}, local_objects={}",
-        local.head.to_hex(),
+        local.repository.head.to_hex(),
         local_object_ids.len()
     );
 
     let (remote_head, fetched_objects, fetched_chunks) = fetch_remote_objects(
-        local.repo_uuid,
+        local.repository.repo_uuid,
         &local_object_ids,
         total_objects_hint,
         64,
@@ -285,36 +289,35 @@ where
     )
     .await?;
 
-    merge_fetched_into_local(base, remote_head, fetched_objects, fetched_chunks)?;
+    merge_fetched_into_local(&mut local, remote_head, fetched_objects, fetched_chunks)?;
     Ok(())
 }
 
 fn merge_fetched_into_local(
-    base: &Path,
+    session: &mut RepositorySession,
     remote_head: ObjectId,
     fetched_objects: BTreeMap<ObjectId, Object>,
     fetched_chunks: BTreeMap<ObjectId, Vec<u8>>,
 ) -> anyhow::Result<()> {
-    let local = Repository::load(base);
-
-    std::fs::create_dir_all(base.join(crate::CHUNKS_DIR))
+    session
+        .chunk_storage
+        .ensure_ready()
         .expect("failed to create chunks directory");
     for (id, data) in fetched_chunks {
-        let path = base.join(format!("{}/{}", crate::CHUNKS_DIR, id.to_hex()));
-        if !path.exists() {
-            std::fs::write(path, data).expect("failed to write chunk");
-        }
+        session
+            .chunk_storage
+            .write_chunk_if_missing(id, &data)
+            .expect("failed to write chunk");
     }
 
-    let mut remote_repo = local.clone();
+    let mut remote_repo = session.repository.clone();
     for (id, obj) in fetched_objects {
         remote_repo.objects.insert(id, obj);
     }
     remote_repo.head = remote_head;
 
-    let mut merged = Repository::load(base);
-    merged.merge(remote_repo);
-    merged.save(base);
+    session.repository.merge(remote_repo);
+    session.save()?;
     debug!("merge complete, repository saved");
 
     Ok(())
@@ -341,19 +344,18 @@ fn collect_chunk_ids(
     Ok(())
 }
 
-fn blob_bytes(repo: &Repository, base: &Path, blob_id: ObjectId) -> anyhow::Result<Vec<u8>> {
-    let blob = match repo.objects.get(&blob_id) {
+fn blob_bytes(session: &RepositorySession, blob_id: ObjectId) -> anyhow::Result<Vec<u8>> {
+    let blob = match session.repository.objects.get(&blob_id) {
         Some(Object::Blob(Blob { chunks, .. })) => *chunks,
         _ => anyhow::bail!("missing blob object {}", blob_id.to_hex()),
     };
 
     let mut chunk_ids = Vec::new();
-    collect_chunk_ids(repo, blob, &mut chunk_ids)?;
+    collect_chunk_ids(&session.repository, blob, &mut chunk_ids)?;
 
     let mut out = Vec::new();
     for id in chunk_ids {
-        let bytes = std::fs::read(base.join(format!("{}/{}", crate::CHUNKS_DIR, id.to_hex())))
-            .with_context(|| format!("missing chunk {}", id.to_hex()))?;
+        let bytes = session.chunk_storage.read_chunk(id)?;
         out.extend_from_slice(&bytes);
     }
 
@@ -433,11 +435,10 @@ fn remove_file_and_empty_parents(base: &Path, rel_path: &str) -> anyhow::Result<
 }
 
 fn checkout_snapshot_from_repo(
-    base: &Path,
-    repo: &Repository,
+    session: &RepositorySession,
     snapshot_id: ObjectId,
 ) -> anyhow::Result<()> {
-    let snap = match repo.objects.get(&snapshot_id) {
+    let snap = match session.repository.objects.get(&snapshot_id) {
         Some(Object::Snapshot(s)) => s,
         _ => anyhow::bail!(
             "requested object is not a snapshot: {}",
@@ -445,7 +446,7 @@ fn checkout_snapshot_from_repo(
         ),
     };
 
-    let tree = match repo.objects.get(&snap.tree) {
+    let tree = match session.repository.objects.get(&snap.tree) {
         Some(Object::Map(m)) => m,
         _ => anyhow::bail!("snapshot tree is not a map"),
     };
@@ -455,12 +456,12 @@ fn checkout_snapshot_from_repo(
             continue;
         };
 
-        let full_path = RelativePath::new(&rel_path).to_path(base);
+        let full_path = RelativePath::new(&rel_path).to_path(&session.base);
         if let Some(parent) = full_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let data = blob_bytes(repo, base, *blob_id)?;
+        let data = blob_bytes(session, *blob_id)?;
         std::fs::write(&full_path, data)?;
     }
 
@@ -480,23 +481,23 @@ pub fn checkout(base: &Path, snapshot_hash: &str) -> anyhow::Result<()> {
     }
     let snapshot_id = ObjectId(out);
 
-    let mut repo = Repository::load(base);
-    let previous_paths = snapshot_file_paths(&repo, repo.head)?;
-    let target_paths = snapshot_file_paths(&repo, snapshot_id)?;
+    let mut repo = RepositorySession::load(base)?;
+    let previous_paths = snapshot_file_paths(&repo.repository, repo.repository.head)?;
+    let target_paths = snapshot_file_paths(&repo.repository, snapshot_id)?;
 
     for rel_path in previous_paths.difference(&target_paths) {
         remove_file_and_empty_parents(base, rel_path)?;
     }
 
-    checkout_snapshot_from_repo(base, &repo, snapshot_id)?;
-    repo.head = snapshot_id;
-    repo.save(base);
+    checkout_snapshot_from_repo(&repo, snapshot_id)?;
+    repo.repository.head = snapshot_id;
+    repo.save()?;
     Ok(())
 }
 
 pub fn checkout_head(base: &Path) -> anyhow::Result<()> {
-    let repo = Repository::load(base);
-    let head_hash = repo.head.to_hex();
+    let repo = RepositorySession::load(base)?;
+    let head_hash = repo.repository.head.to_hex();
     checkout(base, &head_hash)
 }
 
@@ -580,20 +581,23 @@ pub async fn clone_from_resolved_host(
         .disconnect(russh::Disconnect::ByApplication, "", "English")
         .await;
 
-    std::fs::create_dir_all(dest.join(crate::CHUNKS_DIR))?;
+    let mut repo_session = RepositorySession::init(&dest)?;
+    repo_session.chunk_storage.ensure_ready()?;
     for (id, data) in fetched_chunks {
-        std::fs::write(dest.join(format!("{}/{}", crate::CHUNKS_DIR, id.to_hex())), data)?;
+        repo_session.chunk_storage.write_chunk_if_missing(id, &data)?;
     }
+
 
     let repo_data = Repository {
         repo_uuid: repo.repo_uuid,
         objects: fetched_objects,
         head: remote_head,
     };
-    repo_data.save(&dest);
+    repo_session.repository = repo_data;
+    repo_session.save()?;
 
     if !bare {
-        let head_hash = repo_data.head.to_hex();
+        let head_hash = repo_session.repository.head.to_hex();
         checkout(&dest, &head_hash)?;
     }
 
@@ -606,7 +610,7 @@ pub async fn clone_from_resolved_host(
 }
 
 pub async fn fetch_all(base: &Path) -> anyhow::Result<()> {
-    let local = Repository::load(base);
+    let local = RepositorySession::load(base)?.repository;
     let hosts = scan::scan_hosts(5)?;
 
     for host in hosts {

@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, time::SystemTime};
 
 use crate::{ObjectId, Snapshot};
 
-pub(super) fn list_object_id(entries: &[ObjectId]) -> ObjectId {
+pub(crate) fn list_object_id(entries: &[ObjectId]) -> ObjectId {
     let mut h = Sha256::new();
     h.update(b"list");
     for id in entries {
@@ -12,14 +12,14 @@ pub(super) fn list_object_id(entries: &[ObjectId]) -> ObjectId {
     <[u8; 32]>::from(h.finalize()).into()
 }
 
-pub(super) fn blob_object_id(list_id: ObjectId) -> ObjectId {
+pub(crate) fn blob_object_id(list_id: ObjectId) -> ObjectId {
     let mut h = Sha256::new();
     h.update(b"blob");
     h.update(list_id);
     <[u8; 32]>::from(h.finalize()).into()
 }
 
-pub(super) fn map_object_id(files: &BTreeMap<String, ObjectId>) -> ObjectId {
+pub(crate) fn map_object_id(files: &BTreeMap<String, ObjectId>) -> ObjectId {
     let mut h = Sha256::new();
     h.update(b"map");
     let mut entries: Vec<_> = files.iter().collect();
@@ -32,7 +32,7 @@ pub(super) fn map_object_id(files: &BTreeMap<String, ObjectId>) -> ObjectId {
     <[u8; 32]>::from(h.finalize()).into()
 }
 
-pub(super) fn snapshot_object_id(snap: &Snapshot) -> ObjectId {
+pub(crate) fn snapshot_object_id(snap: &Snapshot) -> ObjectId {
     let mut h = Sha256::new();
     h.update(b"snapshot");
     h.update(&snap.tree);

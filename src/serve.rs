@@ -13,64 +13,63 @@ use tokio::sync::RwLock;
 
 use crate::protocol::{Request, Response};
 use crate::pull::RequestSender;
-use crate::{Object, ObjectId, Repository, RepositoryId};
+use crate::{Object, ObjectId, Repository, RepositoryId, RepositorySession};
 
 // ── Server / handler boilerplate ─────────────────────────────────────────────
 
 #[derive(Clone)]
-struct RepoCache {
-    base: PathBuf,
-    cache: Arc<RwLock<Option<Repository>>>,
+struct SessionCache {
+    cache: Arc<RwLock<RepositorySession>>,
 }
 
-impl RepoCache {
-    fn new(base: PathBuf) -> Self {
-        let initial_repo = load_repository(&base).ok();
-        Self {
-            base,
-            cache: Arc::new(RwLock::new(initial_repo)),
-        }
+impl SessionCache {
+    fn new(base: PathBuf) -> Result<Self> {
+        let session = RepositorySession::load(&base)?;
+        Ok(Self {
+            cache: Arc::new(RwLock::new(session)),
+        })
     }
 
-    fn base(&self) -> &Path {
-        &self.base
+    async fn base_path(&self) -> PathBuf {
+        self.cache.read().await.base.clone()
     }
 
-    fn repository_path(&self) -> PathBuf {
-        self.base.join(crate::REPOSITORY_FILE)
+    async fn repository_path(&self) -> PathBuf {
+        let base = self.base_path().await;
+        base.join(crate::REPOSITORY_FILE)
     }
 
     async fn maybe_repository(&self) -> Option<Repository> {
-        self.cache.read().await.clone()
+        Some(self.cache.read().await.repository.clone())
     }
 
     async fn repository(&self) -> Result<Repository> {
-        self.cache
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "repository not found — run `{} init` first",
-                    crate::CRATE_NAME
-                )
-            })
+        Ok(self.cache.read().await.repository.clone())
+    }
+
+    async fn with_session<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&RepositorySession) -> Result<T>,
+    {
+        let guard = self.cache.read().await;
+        f(&guard)
     }
 
     async fn reload(&self) -> Result<()> {
-        let repo = load_repository(&self.base)?;
-        let head = repo.head.to_hex();
-        let object_count = repo.objects.len();
+        let base = self.base_path().await;
+        let session = RepositorySession::load(&base)?;
+        let head = session.repository.head.to_hex();
+        let object_count = session.repository.objects.len();
 
         let mut cache = self.cache.write().await;
-        *cache = Some(repo);
+        *cache = session;
 
         info!("repository cache reloaded: head={head}, objects={object_count}");
         Ok(())
     }
 
     async fn watch_repository_file(self) {
-        let repo_path = self.repository_path();
+        let repo_path = self.repository_path().await;
         let mut last_seen = repository_fingerprint(&repo_path);
 
         loop {
@@ -99,31 +98,31 @@ impl RepoCache {
 
 #[derive(Clone)]
 struct ServerState {
-    repos: Vec<RepoCache>,
+    repos: Vec<SessionCache>,
 }
 
 impl ServerState {
-    fn new(repos: Vec<RepoCache>) -> Self {
+    fn new(repos: Vec<SessionCache>) -> Self {
         Self { repos }
     }
 
-    fn first_repo(&self) -> Result<RepoCache> {
+    fn first_repo(&self) -> Result<SessionCache> {
         self.repos
             .first()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no repositories configured on server"))
     }
 
-    async fn ensure_repo(&self, repo_uuid: RepositoryId) -> Result<(RepoCache, Repository)> {
+    async fn ensure_repo(&self, repo_uuid: RepositoryId) -> Result<(SessionCache, Repository)> {
         let mut available = Vec::new();
 
-        for repo_cache in &self.repos {
-            let Ok(repo) = repo_cache.repository().await else {
+        for session_cache in &self.repos {
+            let Ok(repo) = session_cache.repository().await else {
                 continue;
             };
             available.push(repo.repo_uuid.to_string());
             if repo.repo_uuid == repo_uuid {
-                return Ok((repo_cache.clone(), repo));
+                return Ok((session_cache.clone(), repo));
             }
         }
 
@@ -202,7 +201,7 @@ impl ServerState {
             repo_uuid,
             object_ids.len()
         );
-        let (repo_cache, repo) = self.ensure_repo(repo_uuid).await?;
+        let (session_cache, repo) = self.ensure_repo(repo_uuid).await?;
         let mut objects = Vec::new();
         let mut chunks = Vec::new();
 
@@ -210,12 +209,7 @@ impl ServerState {
             if let Some(obj) = repo.objects.get(id) {
                 objects.push((*id, obj.clone()));
                 if matches!(obj, Object::Chunk(_)) {
-                    let data = std::fs::read(
-                        repo_cache
-                            .base()
-                            .join(format!("{}/{}", crate::CHUNKS_DIR, id.to_hex())),
-                    )
-                    .with_context(|| format!("missing chunk {}", id.to_hex()))?;
+                    let data = session_cache.with_session(|session| session.chunk_storage.read_chunk(*id)).await?;
                     chunks.push((*id, data));
                 }
             }
@@ -234,18 +228,18 @@ impl ServerState {
         repo_uuid: RepositoryId,
         handle: Handle,
     ) -> Result<Response> {
-        let (repo_cache, _local) = self.ensure_repo(repo_uuid).await?;
-        let base = repo_cache.base();
+        let (session_cache, _local) = self.ensure_repo(repo_uuid).await?;
+        let base = session_cache.base_path().await;
 
         info!("push-triggered pull for repo {}", repo_uuid);
         let mut sender = HandleRequestSender {
             handle: handle.clone(),
         };
-        crate::fetch_and_merge_with(base, None, &mut sender).await?;
-        crate::checkout_head(base)?;
+        crate::fetch_and_merge_with(&base, None, &mut sender).await?;
+        crate::checkout_head(&base)?;
         info!("push-triggered pull complete for repo {}", repo_uuid);
 
-        if let Err(err) = repo_cache.reload().await {
+        if let Err(err) = session_cache.reload().await {
             warn!("push completed, but failed to refresh in-memory repository cache: {err:#}");
         }
 
@@ -360,14 +354,6 @@ async fn send_response_frame(
     Ok(())
 }
 
-fn load_repository(base: &Path) -> Result<Repository> {
-    let bytes = std::fs::read(base.join(crate::REPOSITORY_FILE)).context(format!(
-        "repository not found — run `{} init` first",
-        crate::CRATE_NAME
-    ))?;
-    Ok(postcard::from_bytes(&bytes)?)
-}
-
 fn repository_fingerprint(path: &Path) -> Option<(SystemTime, u64)> {
     let meta = std::fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;
@@ -465,24 +451,24 @@ pub async fn serve(port: u16) -> Result<()> {
         ..Default::default()
     });
 
-    let repo_cache = RepoCache::new(PathBuf::from("."));
-    tokio::spawn(repo_cache.clone().watch_repository_file());
+    let session_cache = SessionCache::new(PathBuf::from("."))?;
+    tokio::spawn(session_cache.clone().watch_repository_file());
 
-    let state = ServerState::new(vec![repo_cache]);
+    let state = ServerState::new(vec![session_cache]);
 
     let mut repo_uuids = Vec::new();
     let mut repo_roots = Vec::new();
-    for repo_cache in &state.repos {
-        if let Some(repo) = repo_cache.maybe_repository().await {
+    for session_cache in &state.repos {
+        if let Some(repo) = session_cache.maybe_repository().await {
             repo_uuids.push(repo.repo_uuid);
-            let root = if repo_cache.base() == Path::new(".") {
+            let base = session_cache.base_path().await;
+            let root = if base == Path::new(".") {
                 std::env::current_dir()
                     .ok()
                     .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
                     .unwrap_or_else(|| "<unknown>".to_string())
             } else {
-                repo_cache
-                    .base()
+                base
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "<unknown>".to_string())

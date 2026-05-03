@@ -28,13 +28,13 @@ fn main() -> anyhow::Result<()> {
 
     match matches.subcommand() {
         Some(("init", _)) => {
-            scup::Repository::init(Path::new("."));
+            let _ = scup::RepositorySession::init(Path::new("."))?;
         }
         Some(("snapshot", sub)) => {
             let message = sub.get_one::<String>("message").cloned();
             let base = Path::new(".");
-            let mut repo = scup::Repository::load(base);
-            repo.snapshot(base, message);
+            let mut session = scup::RepositorySession::load(base)?;
+            session.snapshot(message);
         }
         Some(("debug", sub)) => match sub.subcommand() {
             Some(("chunk", sub)) => {
@@ -44,8 +44,8 @@ fn main() -> anyhow::Result<()> {
                 scup::debug_chunk_file(path);
             }
             Some(("print-repo", _)) => {
-                let repo: scup::Repository = scup::Repository::load(Path::new("."));
-                info!("{:#?}", repo);
+                let session = scup::RepositorySession::load(Path::new("."))?;
+                info!("{:#?}", session.repository);
             }
             Some(("status", sub)) => {
                 let host_id = sub

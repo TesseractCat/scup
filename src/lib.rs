@@ -7,17 +7,20 @@ use std::{
 mod chunk;
 mod repository;
 mod rollsum;
+mod storage;
 mod transport;
 
 mod model;
 pub use model::{
     Blob, Chunk, List, Map, Object, ObjectId, Repository, RepositoryId, Snapshot, to_hex,
 };
+pub use session::RepositorySession;
 
 mod protocol;
 mod pull;
 mod scan;
 mod serve;
+mod session;
 
 pub(crate) use pull::fetch_and_merge_with;
 pub use pull::{checkout, checkout_head, fetch_all, pull_all};
@@ -78,7 +81,7 @@ pub async fn debug_status(host_id: &str) -> anyhow::Result<()> {
 }
 
 pub async fn push_all(base: &Path) -> anyhow::Result<()> {
-    let local = Repository::load(base);
+    let local = RepositorySession::load(base)?.repository;
     let hosts = scan::scan_hosts(5)?;
 
     for host in hosts {
