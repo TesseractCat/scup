@@ -20,7 +20,7 @@ fn wait_for_scan_host(local_dir: &Path, expected_fullname: &str, timeout: Durati
                     .arg("2");
                 cmd
             },
-            "syncup scan",
+            "scup scan",
         );
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -59,7 +59,7 @@ fn sha256_file(path: &Path) -> String {
 
 #[test]
 fn clone_repo_from_host_by_root_name() {
-    let root = unique_temp_dir("syncup-clone");
+    let root = unique_temp_dir("scup-clone");
     let origin = root.join("origin-repo");
     let client = root.join("client");
 
@@ -85,12 +85,12 @@ fn clone_repo_from_host_by_root_name() {
             cmd.current_dir(&origin).arg("init");
             cmd
         },
-        "syncup init (origin)",
+        "scup init (origin)",
     );
 
     let port = free_port();
-    let host_tag = format!("syncup-test-clone-{}", std::process::id());
-    let expected_fullname = format!("syncup-{host_tag}._syncup._tcp.local.");
+    let host_tag = format!("scup-test-clone-{}", std::process::id());
+    let expected_fullname = format!("scup-{host_tag}._scup._tcp.local.");
 
     let server = ChildGuard({
         let mut cmd = Command::new(bin());
@@ -101,7 +101,7 @@ fn clone_repo_from_host_by_root_name() {
             .arg(port.to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        cmd.spawn().expect("failed to start syncup serve")
+        cmd.spawn().expect("failed to start scup serve")
     });
 
     wait_for_tcp(("127.0.0.1", port), Duration::from_secs(10));
@@ -116,12 +116,12 @@ fn clone_repo_from_host_by_root_name() {
                 .arg("origin-repo");
             cmd
         },
-        "syncup clone",
+        "scup clone",
     );
 
     let cloned_repo_dir = client.join("origin-repo");
     assert!(
-        cloned_repo_dir.join(".syncup/repository").exists(),
+        cloned_repo_dir.join(".scup/repository").exists(),
         "cloned repository file missing"
     );
     assert!(
@@ -133,8 +133,8 @@ fn clone_repo_from_host_by_root_name() {
         "cloned random.bin missing"
     );
 
-    let src_repo = syncup::Repository::load(&origin);
-    let cloned_repo = syncup::Repository::load(&cloned_repo_dir);
+    let src_repo = scup::Repository::load(&origin);
+    let cloned_repo = scup::Repository::load(&cloned_repo_dir);
 
     assert_eq!(cloned_repo.repo_uuid, src_repo.repo_uuid);
     assert_eq!(cloned_repo.head, src_repo.head);

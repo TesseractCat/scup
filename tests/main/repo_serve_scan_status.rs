@@ -15,7 +15,7 @@ fn scan_until_found(expected_fullname: &str, expected_port: u16) {
                 cmd.arg("scan").arg("--timeout").arg("2");
                 cmd
             },
-            "syncup scan",
+            "scup scan",
         );
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -37,10 +37,10 @@ fn scan_until_found(expected_fullname: &str, expected_port: u16) {
 
 #[test]
 fn init_serve_scan_and_get_status() {
-    let repo_dir = unique_temp_dir("syncup-e2e-repo");
+    let repo_dir = unique_temp_dir("scup-e2e-repo");
 
     // Create tiny content so init's first snapshot has at least one regular file.
-    fs::write(repo_dir.join("hello.txt"), b"hello syncup\n").expect("failed to write seed file");
+    fs::write(repo_dir.join("hello.txt"), b"hello scup\n").expect("failed to write seed file");
 
     run_ok(
         {
@@ -48,14 +48,14 @@ fn init_serve_scan_and_get_status() {
             cmd.arg("init").current_dir(&repo_dir);
             cmd
         },
-        "syncup init",
+        "scup init",
     );
 
-    assert!(Path::new(&repo_dir.join(".syncup/repository")).exists());
+    assert!(Path::new(&repo_dir.join(".scup/repository")).exists());
 
     let port = free_port();
-    let host_tag = format!("syncup-test-{}", std::process::id());
-    let expected_fullname = format!("syncup-{host_tag}._syncup._tcp.local.");
+    let host_tag = format!("scup-test-{}", std::process::id());
+    let expected_fullname = format!("scup-{host_tag}._scup._tcp.local.");
 
     let child = {
         let mut cmd = Command::new(bin());
@@ -66,7 +66,7 @@ fn init_serve_scan_and_get_status() {
             .current_dir(&repo_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        cmd.spawn().expect("failed to spawn syncup serve")
+        cmd.spawn().expect("failed to spawn scup serve")
     };
     let child = ChildGuard(child);
 
@@ -80,7 +80,7 @@ fn init_serve_scan_and_get_status() {
             cmd.arg("debug").arg("status").arg(&expected_fullname);
             cmd
         },
-        "syncup debug status",
+        "scup debug status",
     );
 
     let stdout = String::from_utf8_lossy(&status_out.stdout);

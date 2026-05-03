@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Arg, ArgAction, Command, arg, value_parser};
 
 pub fn cli() -> Command {
-    Command::new(syncup::CRATE_NAME)
+    Command::new(scup::CRATE_NAME)
         .about("File synchronization and backup program")
         .subcommand_required(true)
         .arg_required_else_help(true)
@@ -14,7 +14,7 @@ pub fn cli() -> Command {
                 .long("verbose")
                 .help(format!(
                     "Enable verbose logging for {} (use -vv for all logs)",
-                    syncup::CRATE_NAME
+                    scup::CRATE_NAME
                 ))
                 .global(true)
                 .action(ArgAction::Count),

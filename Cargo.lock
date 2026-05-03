@@ -1640,6 +1640,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "scup"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "derive_more",
+ "env_logger",
+ "ignore",
+ "kdam",
+ "log",
+ "mdns-sd",
+ "postcard",
+ "rand",
+ "relative-path",
+ "russh",
+ "russh-keys",
+ "serde",
+ "sha2 0.11.0",
+ "tokio",
+]
+
+[[package]]
 name = "sec1"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1878,29 +1901,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "syncup"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "clap",
- "derive_more",
- "env_logger",
- "ignore",
- "kdam",
- "log",
- "mdns-sd",
- "postcard",
- "rand",
- "relative-path",
- "russh",
- "russh-keys",
- "serde",
- "sha2 0.11.0",
- "tokio",
 ]
 
 [[package]]

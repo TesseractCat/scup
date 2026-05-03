@@ -18,7 +18,7 @@ fn wait_for_scan_host(local_dir: &Path, expected_fullname: &str, timeout: Durati
                     .arg("2");
                 cmd
             },
-            "syncup scan",
+            "scup scan",
         );
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -51,7 +51,7 @@ fn generate_key(path: &Path) {
 
 #[test]
 fn authentication_fails_with_invalid_key() {
-    let root = unique_temp_dir("syncup-auth-fail");
+    let root = unique_temp_dir("scup-auth-fail");
     let repo_dir = root.join("repo");
     let client_dir = root.join("client");
     fs::create_dir_all(&repo_dir).expect("failed to create repo dir");
@@ -64,7 +64,7 @@ fn authentication_fails_with_invalid_key() {
             cmd.current_dir(&repo_dir).arg("init");
             cmd
         },
-        "syncup init",
+        "scup init",
     );
 
     let valid_key = root.join("valid_key");
@@ -73,8 +73,8 @@ fn authentication_fails_with_invalid_key() {
     generate_key(&invalid_key);
 
     let port = free_port();
-    let host_tag = format!("syncup-test-auth-{}", std::process::id());
-    let expected_fullname = format!("syncup-{host_tag}._syncup._tcp.local.");
+    let host_tag = format!("scup-test-auth-{}", std::process::id());
+    let expected_fullname = format!("scup-{host_tag}._scup._tcp.local.");
 
     let server = ChildGuard({
         let mut cmd = Command::new(bin());
@@ -87,7 +87,7 @@ fn authentication_fails_with_invalid_key() {
             .arg(port.to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        cmd.spawn().expect("failed to start syncup serve")
+        cmd.spawn().expect("failed to start scup serve")
     });
 
     wait_for_tcp(("127.0.0.1", port), Duration::from_secs(10));
@@ -101,7 +101,7 @@ fn authentication_fails_with_invalid_key() {
             .arg("debug")
             .arg("status")
             .arg(&expected_fullname);
-        cmd.output().expect("failed to run syncup debug status")
+        cmd.output().expect("failed to run scup debug status")
     };
 
     assert!(

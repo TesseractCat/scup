@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-use syncup::{Blob, List, Map, Object, ObjectId, Repository};
+use scup::{Blob, List, Map, Object, ObjectId, Repository};
 
 fn copy_dir_recursive(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).expect("failed to create destination directory");
@@ -39,7 +39,7 @@ fn wait_for_scan_hosts(local_dir: &Path, expected_fullnames: &[String], timeout:
                     .arg("2");
                 cmd
             },
-            "syncup scan",
+            "scup scan",
         );
         let stdout = String::from_utf8_lossy(&out.stdout);
         let ok = expected_fullnames
@@ -55,7 +55,7 @@ fn wait_for_scan_hosts(local_dir: &Path, expected_fullnames: &[String], timeout:
 }
 
 fn read_repo(dir: &Path) -> Repository {
-    let bytes = fs::read(dir.join(".syncup/repository")).expect("failed to read repository file");
+    let bytes = fs::read(dir.join(".scup/repository")).expect("failed to read repository file");
     postcard::from_bytes(&bytes).expect("failed to deserialize repository")
 }
 
@@ -110,7 +110,7 @@ fn file_content_from_repo(dir: &Path, repo: &Repository, filename: &str) -> Vec<
 
     let mut out = Vec::new();
     for id in chunk_ids {
-        let path = dir.join(format!(".syncup/chunks/{}", id.to_hex()));
+        let path = dir.join(format!(".scup/chunks/{}", id.to_hex()));
         let bytes = fs::read(path).expect("failed to read chunk");
         out.extend_from_slice(&bytes);
     }
@@ -119,7 +119,7 @@ fn file_content_from_repo(dir: &Path, repo: &Repository, filename: &str) -> Vec<
 
 #[test]
 fn push_pull_multiple_remotes_then_conflict() {
-    let root = unique_temp_dir("syncup-multi-remote");
+    let root = unique_temp_dir("scup-multi-remote");
     let seed = root.join("seed");
     let local = root.join("local");
     let remote1 = root.join("remote1");
@@ -134,7 +134,7 @@ fn push_pull_multiple_remotes_then_conflict() {
             cmd.current_dir(&seed).arg("init");
             cmd
         },
-        "syncup init (seed)",
+        "scup init (seed)",
     );
 
     copy_dir_recursive(&seed, &local);
@@ -143,10 +143,10 @@ fn push_pull_multiple_remotes_then_conflict() {
 
     let port1 = free_port();
     let port2 = free_port();
-    let host1 = format!("syncup-test-r1-{}", std::process::id());
-    let host2 = format!("syncup-test-r2-{}", std::process::id());
-    let full1 = format!("syncup-{host1}._syncup._tcp.local.");
-    let full2 = format!("syncup-{host2}._syncup._tcp.local.");
+    let host1 = format!("scup-test-r1-{}", std::process::id());
+    let host2 = format!("scup-test-r2-{}", std::process::id());
+    let full1 = format!("scup-{host1}._scup._tcp.local.");
+    let full2 = format!("scup-{host2}._scup._tcp.local.");
 
     let server1 = ChildGuard({
         let mut cmd = Command::new(bin());

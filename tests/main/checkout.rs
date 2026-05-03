@@ -4,7 +4,7 @@ use std::process::Command;
 
 #[test]
 fn checkout_moves_head_and_removes_files_not_in_target_snapshot() {
-    let repo_dir = unique_temp_dir("syncup-checkout");
+    let repo_dir = unique_temp_dir("scup-checkout");
 
     fs::write(repo_dir.join("note.txt"), b"v1\n").expect("failed to write initial file");
 
@@ -14,10 +14,10 @@ fn checkout_moves_head_and_removes_files_not_in_target_snapshot() {
             cmd.current_dir(&repo_dir).arg("init");
             cmd
         },
-        "syncup init",
+        "scup init",
     );
 
-    let repo_after_init = syncup::Repository::load(&repo_dir);
+    let repo_after_init = scup::Repository::load(&repo_dir);
     let first_head = repo_after_init.head;
 
     fs::write(repo_dir.join("note.txt"), b"v2\n").expect("failed to update file");
@@ -31,10 +31,10 @@ fn checkout_moves_head_and_removes_files_not_in_target_snapshot() {
                 .arg("second snapshot");
             cmd
         },
-        "syncup snapshot",
+        "scup snapshot",
     );
 
-    let repo_after_second = syncup::Repository::load(&repo_dir);
+    let repo_after_second = scup::Repository::load(&repo_dir);
     let second_head = repo_after_second.head;
     assert_ne!(
         first_head, second_head,
@@ -57,7 +57,7 @@ fn checkout_moves_head_and_removes_files_not_in_target_snapshot() {
                 .arg(first_head.to_hex());
             cmd
         },
-        "syncup checkout <first_head>",
+        "scup checkout <first_head>",
     );
 
     assert_eq!(
@@ -69,7 +69,7 @@ fn checkout_moves_head_and_removes_files_not_in_target_snapshot() {
         "checkout should remove files not present in target snapshot"
     );
 
-    let repo_after_checkout = syncup::Repository::load(&repo_dir);
+    let repo_after_checkout = scup::Repository::load(&repo_dir);
     assert_eq!(
         repo_after_checkout.head, first_head,
         "checkout should move repository head to the checked-out snapshot"

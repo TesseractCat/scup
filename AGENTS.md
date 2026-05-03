@@ -1,7 +1,7 @@
 # AGENTS
 
 ## Repository goal
-`syncup` is a unification of **Git-like history** and **Syncthing-like automatic synchronization**. It is designed for:
+`scup` is a unification of **Git-like history** and **Syncthing-like automatic synchronization**. It is designed for:
 - large files (content-defined chunking + deduplicated object storage),
 - full history (snapshot/object model),
 - automatic synchronization across peers (LAN discovery + push/pull + clone).
@@ -17,4 +17,4 @@
 - `src/pull.rs` — pull and clone flows.
 - `src/rollsum.rs` — rolling checksum and chunk split parameters.
 - `tests/` — integration tests for repository, serving, scan, push/pull, and conflict flows.
-- `.syncup/` (runtime, created in synced folders) — local repository metadata and chunk store.
+- `.scup/` (runtime, created in synced folders) — local repository metadata and chunk store.

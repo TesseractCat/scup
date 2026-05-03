@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_syncup")
+    env!("CARGO_BIN_EXE_scup")
 }
 
 pub fn unique_temp_dir(prefix: &str) -> PathBuf {

@@ -1,7 +1,8 @@
 [package]
-name = "syncup"
+name = "scup"
 version = "0.1.0"
 edition = "2024"
+description = "Git-like history with Syncthing-like automatic synchronization for large files"
 
 [dependencies]
 anyhow = "1"
