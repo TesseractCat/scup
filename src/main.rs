@@ -6,11 +6,11 @@ use cli::cli;
 
 fn init_logger(verbosity: u8) {
     let default_level = if verbosity >= 2 {
-        "debug"
+        "debug".to_string()
     } else if verbosity >= 1 {
-        "info,syncup=debug"
+        format!("info,{}=debug", syncup::CRATE_NAME)
     } else {
-        "info"
+        "info".to_string()
     };
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))

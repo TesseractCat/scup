@@ -125,7 +125,7 @@ pub(crate) async fn connect_and_auth(
             .ok_or_else(|| anyhow::anyhow!("failed to generate client key"))?
     };
 
-    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "syncup".to_string());
+    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| crate::CRATE_NAME.to_string());
     let auth_ok = session
         .authenticate_publickey(hostname, Arc::new(client_key))
         .await?;

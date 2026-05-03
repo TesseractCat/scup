@@ -1,15 +1,21 @@
 use std::path::PathBuf;
 
-use clap::{ArgAction, Command, arg, value_parser};
+use clap::{Arg, ArgAction, Command, arg, value_parser};
 
 pub fn cli() -> Command {
-    Command::new("syncup")
+    Command::new(syncup::CRATE_NAME)
         .about("File synchronization and backup program")
         .subcommand_required(true)
         .arg_required_else_help(true)
         .allow_external_subcommands(true)
         .arg(
-            arg!(-v --verbose "Enable verbose logging for syncup (use -vv for all logs)")
+            Arg::new("verbose")
+                .short('v')
+                .long("verbose")
+                .help(format!(
+                    "Enable verbose logging for {} (use -vv for all logs)",
+                    syncup::CRATE_NAME
+                ))
                 .global(true)
                 .action(ArgAction::Count),
         )

@@ -90,8 +90,8 @@ fn build_fanout_list(repo: &mut Repository, leaves: &[(ObjectId, u64)]) -> Objec
 
 impl Repository {
     pub fn init(base: &Path) -> Self {
-        std::fs::create_dir_all(base.join(".syncup/chunks"))
-            .expect("failed to create .syncup/chunks");
+        std::fs::create_dir_all(base.join(crate::CHUNKS_DIR))
+            .expect("failed to create chunks directory");
         let mut repo_uuid = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut repo_uuid);
 
@@ -106,8 +106,8 @@ impl Repository {
     }
 
     pub fn snapshot(&mut self, base: &Path, message: Option<String>) {
-        std::fs::create_dir_all(base.join(".syncup/chunks"))
-            .expect("failed to create .syncup/chunks");
+        std::fs::create_dir_all(base.join(crate::CHUNKS_DIR))
+            .expect("failed to create chunks directory");
 
         // Build path -> (mtime, blob_id) from the previous snapshot's tree.
         let prev_tree: BTreeMap<String, (Option<SystemTime>, ObjectId)> = {
@@ -151,7 +151,7 @@ impl Repository {
             else {
                 continue;
             };
-            if rel_path == ".syncup" || rel_path.starts_with(".syncup/") {
+            if rel_path == crate::REPO_DIR_NAME || rel_path.starts_with(crate::REPO_DIR_PREFIX) {
                 continue;
             }
 
@@ -183,8 +183,11 @@ impl Repository {
                     chunk.unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
                 chunk_leaves.push((id, digest));
                 self.objects.entry(id).or_insert_with(|| {
-                    std::fs::write(base.join(format!(".syncup/chunks/{}", id.to_hex())), &data)
-                        .expect("failed to write chunk");
+                    std::fs::write(
+                        base.join(format!("{}/{}", crate::CHUNKS_DIR, id.to_hex())),
+                        &data,
+                    )
+                    .expect("failed to write chunk");
                     Object::Chunk(Chunk)
                 });
             }

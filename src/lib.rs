@@ -23,6 +23,13 @@ pub(crate) use pull::fetch_and_merge_with;
 pub use pull::{checkout, checkout_head, fetch_all, pull_all};
 pub(crate) use transport::ssh::{connect_and_auth, rpc};
 
+pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+pub const REPO_DIR_NAME: &str = concat!(".", env!("CARGO_PKG_NAME"));
+pub const REPO_DIR_PREFIX: &str = concat!(".", env!("CARGO_PKG_NAME"), "/");
+pub const REPOSITORY_FILE: &str = concat!(".", env!("CARGO_PKG_NAME"), "/repository");
+pub const CHUNKS_DIR: &str = concat!(".", env!("CARGO_PKG_NAME"), "/chunks");
+pub const MDNS_SERVICE_TYPE: &str = concat!("_", env!("CARGO_PKG_NAME"), "._tcp.local.");
+
 static KEY_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn set_key_override(path: PathBuf) {

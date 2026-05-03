@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use crate::RepositoryId;
 
-const MDNS_SERVICE_TYPE: &str = "_syncup._tcp.local.";
 
 #[derive(Clone, Debug)]
 pub struct ScannedRepo {
@@ -81,7 +80,7 @@ impl ScannedHost {
 pub fn scan_hosts(timeout_secs: u64) -> Result<Vec<ScannedHost>> {
     let mdns = ServiceDaemon::new().context("failed to start mDNS daemon")?;
     let receiver = mdns
-        .browse(MDNS_SERVICE_TYPE)
+        .browse(crate::MDNS_SERVICE_TYPE)
         .context("failed to browse mDNS service type")?;
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
@@ -113,14 +112,14 @@ pub fn scan_hosts(timeout_secs: u64) -> Result<Vec<ScannedHost>> {
         }
     }
 
-    let _ = mdns.stop_browse(MDNS_SERVICE_TYPE);
+    let _ = mdns.stop_browse(crate::MDNS_SERVICE_TYPE);
     mdns.shutdown().context("failed to shutdown mDNS daemon")?;
 
     Ok(hosts)
 }
 
 pub fn scan(timeout_secs: u64) -> Result<()> {
-    info!("Browsing for {MDNS_SERVICE_TYPE} for {timeout_secs}s...");
+    info!("Browsing for {} for {timeout_secs}s...", crate::MDNS_SERVICE_TYPE);
     let hosts = scan_hosts(timeout_secs)?;
 
     for host in &hosts {
@@ -146,7 +145,7 @@ pub fn scan(timeout_secs: u64) -> Result<()> {
     }
 
     if hosts.is_empty() {
-        info!("No syncup servers found.");
+        info!("No {} servers found.", crate::CRATE_NAME);
     } else {
         info!("Found {} server(s).", hosts.len());
     }
@@ -157,7 +156,7 @@ pub fn scan(timeout_secs: u64) -> Result<()> {
 pub fn resolve_host(host_id: &str, timeout_secs: u64) -> Result<ScannedHost> {
     let mdns = ServiceDaemon::new().context("failed to start mDNS daemon")?;
     let receiver = mdns
-        .browse(MDNS_SERVICE_TYPE)
+        .browse(crate::MDNS_SERVICE_TYPE)
         .context("failed to browse mDNS service type")?;
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
@@ -176,14 +175,14 @@ pub fn resolve_host(host_id: &str, timeout_secs: u64) -> Result<ScannedHost> {
         if let ServiceEvent::ServiceResolved(info) = event {
             let host = ScannedHost::from_resolved_info(&info);
             if host.fullname == host_id {
-                let _ = mdns.stop_browse(MDNS_SERVICE_TYPE);
+                let _ = mdns.stop_browse(crate::MDNS_SERVICE_TYPE);
                 mdns.shutdown().context("failed to shutdown mDNS daemon")?;
                 return Ok(host);
             }
         }
     }
 
-    let _ = mdns.stop_browse(MDNS_SERVICE_TYPE);
+    let _ = mdns.stop_browse(crate::MDNS_SERVICE_TYPE);
     mdns.shutdown().context("failed to shutdown mDNS daemon")?;
 
     Err(anyhow!("host id not found: {host_id}"))

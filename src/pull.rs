@@ -78,7 +78,7 @@ pub(crate) fn local_pull_response(base: &Path, req: protocol::Request) -> protoc
                     if let Some(obj) = repo.objects.get(&id) {
                         objects.push((id, obj.clone()));
                         if matches!(obj, Object::Chunk(_)) {
-                            let path = base.join(format!(".syncup/chunks/{}", id.to_hex()));
+                            let path = base.join(format!("{}/{}", crate::CHUNKS_DIR, id.to_hex()));
                             if let Ok(bytes) = std::fs::read(path) {
                                 chunks.push((id, bytes));
                             }
@@ -297,9 +297,10 @@ fn merge_fetched_into_local(
 ) -> anyhow::Result<()> {
     let local = Repository::load(base);
 
-    std::fs::create_dir_all(base.join(".syncup/chunks")).expect("failed to create .syncup/chunks");
+    std::fs::create_dir_all(base.join(crate::CHUNKS_DIR))
+        .expect("failed to create chunks directory");
     for (id, data) in fetched_chunks {
-        let path = base.join(format!(".syncup/chunks/{}", id.to_hex()));
+        let path = base.join(format!("{}/{}", crate::CHUNKS_DIR, id.to_hex()));
         if !path.exists() {
             std::fs::write(path, data).expect("failed to write chunk");
         }
@@ -351,7 +352,7 @@ fn blob_bytes(repo: &Repository, base: &Path, blob_id: ObjectId) -> anyhow::Resu
 
     let mut out = Vec::new();
     for id in chunk_ids {
-        let bytes = std::fs::read(base.join(format!(".syncup/chunks/{}", id.to_hex())))
+        let bytes = std::fs::read(base.join(format!("{}/{}", crate::CHUNKS_DIR, id.to_hex())))
             .with_context(|| format!("missing chunk {}", id.to_hex()))?;
         out.extend_from_slice(&bytes);
     }
@@ -372,7 +373,7 @@ fn normalized_repo_path(raw_path: &str) -> Option<String> {
         return None;
     }
 
-    if normalized == ".syncup" || normalized.starts_with(".syncup/") {
+    if normalized == crate::REPO_DIR_NAME || normalized.starts_with(crate::REPO_DIR_PREFIX) {
         return None;
     }
 
@@ -579,9 +580,9 @@ pub async fn clone_from_resolved_host(
         .disconnect(russh::Disconnect::ByApplication, "", "English")
         .await;
 
-    std::fs::create_dir_all(dest.join(".syncup/chunks"))?;
+    std::fs::create_dir_all(dest.join(crate::CHUNKS_DIR))?;
     for (id, data) in fetched_chunks {
-        std::fs::write(dest.join(format!(".syncup/chunks/{}", id.to_hex())), data)?;
+        std::fs::write(dest.join(format!("{}/{}", crate::CHUNKS_DIR, id.to_hex())), data)?;
     }
 
     let repo_data = Repository {

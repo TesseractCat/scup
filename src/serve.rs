@@ -37,7 +37,7 @@ impl RepoCache {
     }
 
     fn repository_path(&self) -> PathBuf {
-        self.base.join(".syncup/repository")
+        self.base.join(crate::REPOSITORY_FILE)
     }
 
     async fn maybe_repository(&self) -> Option<Repository> {
@@ -49,7 +49,12 @@ impl RepoCache {
             .read()
             .await
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("repository not found — run `syncup init` first"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "repository not found — run `{} init` first",
+                    crate::CRATE_NAME
+                )
+            })
     }
 
     async fn reload(&self) -> Result<()> {
@@ -123,7 +128,10 @@ impl ServerState {
         }
 
         if available.is_empty() {
-            anyhow::bail!("repository not found - run `syncup init` first");
+            anyhow::bail!(
+                "repository not found - run `{} init` first",
+                crate::CRATE_NAME
+            );
         }
 
         anyhow::bail!(
@@ -205,7 +213,7 @@ impl ServerState {
                     let data = std::fs::read(
                         repo_cache
                             .base()
-                            .join(format!(".syncup/chunks/{}", id.to_hex())),
+                            .join(format!("{}/{}", crate::CHUNKS_DIR, id.to_hex())),
                     )
                     .with_context(|| format!("missing chunk {}", id.to_hex()))?;
                     chunks.push((*id, data));
@@ -353,8 +361,10 @@ async fn send_response_frame(
 }
 
 fn load_repository(base: &Path) -> Result<Repository> {
-    let bytes = std::fs::read(base.join(".syncup/repository"))
-        .context("repository not found — run `syncup init` first")?;
+    let bytes = std::fs::read(base.join(crate::REPOSITORY_FILE)).context(format!(
+        "repository not found — run `{} init` first",
+        crate::CRATE_NAME
+    ))?;
     Ok(postcard::from_bytes(&bytes)?)
 }
 
@@ -399,7 +409,6 @@ fn load_server_keys() -> Result<(KeyPair, Option<russh_keys::key::PublicKey>)> {
 
 // ── mDNS server scan ────────────────────────────────────────────────────────
 
-const MDNS_SERVICE_TYPE: &str = "_syncup._tcp.local.";
 
 fn advertise_mdns(
     port: u16,
@@ -408,8 +417,8 @@ fn advertise_mdns(
 ) -> Result<ServiceDaemon> {
     let mdns = ServiceDaemon::new().context("failed to start mDNS daemon")?;
 
-    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "syncup".to_string());
-    let instance_name = format!("syncup-{hostname}");
+    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| crate::CRATE_NAME.to_string());
+    let instance_name = format!("{}-{hostname}", crate::CRATE_NAME);
     let host_name = format!("{hostname}.local.");
 
     let mut properties = HashMap::new();
@@ -422,7 +431,7 @@ fn advertise_mdns(
     properties.insert("roots".to_string(), repo_roots.join(","));
 
     let service = ServiceInfo::new(
-        MDNS_SERVICE_TYPE,
+        crate::MDNS_SERVICE_TYPE,
         &instance_name,
         &host_name,
         "",
@@ -436,7 +445,8 @@ fn advertise_mdns(
         .context("failed to register mDNS service")?;
 
     info!(
-        "mDNS advertised: {instance_name}.{MDNS_SERVICE_TYPE} -> {host_name}:{port} repos={} roots={}",
+        "mDNS advertised: {instance_name}.{} -> {host_name}:{port} repos={} roots={}",
+        crate::MDNS_SERVICE_TYPE,
         repo_uuids.len(),
         repo_roots.join(",")
     );
@@ -450,7 +460,7 @@ pub async fn serve(port: u16) -> Result<()> {
 
     let config = Arc::new(russh::server::Config {
         // RFC 4253: identification string must start with "SSH-2.0-".
-        server_id: russh::SshId::Standard("SSH-2.0-syncup-ssh".into()),
+        server_id: russh::SshId::Standard(format!("SSH-2.0-{}-ssh", crate::CRATE_NAME).into()),
         keys: vec![host_key],
         ..Default::default()
     });
