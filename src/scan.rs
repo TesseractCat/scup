@@ -1,3 +1,10 @@
+fn host_id_from_fullname(fullname: &str) -> String {
+    let service_suffix = format!(".{}", crate::MDNS_SERVICE_TYPE);
+    let instance = fullname.strip_suffix(&service_suffix).unwrap_or(fullname);
+    let prefix = format!("{}-", crate::CRATE_NAME);
+    instance.strip_prefix(&prefix).unwrap_or(instance).to_string()
+}
+
 use anyhow::{Context, Result, anyhow};
 use log::{debug, info};
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
@@ -48,6 +55,7 @@ impl ScannedRepo {
 
 #[derive(Clone, Debug)]
 pub struct ScannedHost {
+    pub id: String,
     pub fullname: String,
     pub addrs: Vec<IpAddr>,
     pub port: u16,
@@ -68,8 +76,10 @@ impl ScannedHost {
             info.get_property_val_str("roots"),
         );
 
+        let fullname = info.get_fullname().to_string();
         Self {
-            fullname: info.get_fullname().to_string(),
+            id: host_id_from_fullname(&fullname),
+            fullname,
             addrs,
             port: info.get_port(),
             repos,
@@ -100,10 +110,10 @@ pub fn scan_hosts(timeout_secs: u64) -> Result<Vec<ScannedHost>> {
 
         if let ServiceEvent::ServiceResolved(info) = event {
             let host = ScannedHost::from_resolved_info(&info);
-            if seen.insert(host.fullname.clone()) {
+            if seen.insert(host.id.clone()) {
                 debug!(
                     "resolved host {}:{} repos={}",
-                    host.fullname,
+                    host.id,
                     host.port,
                     host.repos.len(),
                 );
@@ -141,7 +151,7 @@ pub fn scan(timeout_secs: u64) -> Result<()> {
                 .join(",")
         };
 
-        info!("- {} at {addrs}:{} repos={repos}", host.fullname, host.port);
+        info!("- {} at {addrs}:{} repos={repos}", host.id, host.port);
     }
 
     if hosts.is_empty() {
@@ -174,7 +184,7 @@ pub fn resolve_host(host_id: &str, timeout_secs: u64) -> Result<ScannedHost> {
 
         if let ServiceEvent::ServiceResolved(info) = event {
             let host = ScannedHost::from_resolved_info(&info);
-            if host.fullname == host_id {
+            if host.id == host_id || host.fullname == host_id {
                 let _ = mdns.stop_browse(crate::MDNS_SERVICE_TYPE);
                 mdns.shutdown().context("failed to shutdown mDNS daemon")?;
                 return Ok(host);

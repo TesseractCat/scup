@@ -21,8 +21,17 @@ pub fn cli() -> Command {
         )
         .arg(
             arg!(--key <PATH> "SSH private key path (overrides auto discovery)")
+                .short('k')
+                .visible_short_alias('i')
                 .global(true)
                 .value_parser(value_parser!(PathBuf)),
+        )
+        .arg(
+            arg!(--timeout <SECONDS> "How long to browse for services")
+                .short('t')
+                .global(true)
+                .default_value("1")
+                .value_parser(value_parser!(u64)),
         )
         .subcommand(Command::new("init").about("Initialize repository"))
         .subcommand(
@@ -79,12 +88,7 @@ pub fn cli() -> Command {
         )
         .subcommand(
             Command::new("scan")
-                .about("Scan for sync servers on the local network via mDNS")
-                .arg(
-                    arg!(--timeout <SECONDS> "How long to browse for services")
-                        .default_value("3")
-                        .value_parser(value_parser!(u64)),
-                ),
+                .about("Scan for sync servers on the local network via mDNS"),
         )
         .subcommand(
             Command::new("serve").about("Start sync server").arg(
