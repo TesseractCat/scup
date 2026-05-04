@@ -27,7 +27,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
     }
 }
 
-fn wait_for_scan_hosts(local_dir: &Path, expected_fullnames: &[String], timeout: Duration) {
+fn wait_for_scan_hosts(local_dir: &Path, expected_host_ids: &[String], timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         let out = run_ok(
@@ -42,7 +42,7 @@ fn wait_for_scan_hosts(local_dir: &Path, expected_fullnames: &[String], timeout:
             "scup scan",
         );
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let ok = expected_fullnames
+        let ok = expected_host_ids
             .iter()
             .all(|name| stdout.lines().any(|line| line.contains(name)));
         if ok {
@@ -145,8 +145,8 @@ fn push_pull_multiple_remotes_then_conflict() {
     let port2 = free_port();
     let host1 = format!("scup-test-r1-{}", std::process::id());
     let host2 = format!("scup-test-r2-{}", std::process::id());
-    let full1 = format!("scup-{host1}._scup._tcp.local.");
-    let full2 = format!("scup-{host2}._scup._tcp.local.");
+    let full1 = host1.clone();
+    let full2 = host2.clone();
 
     let server1 = ChildGuard({
         let mut cmd = Command::new(bin());

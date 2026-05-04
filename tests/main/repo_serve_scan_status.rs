@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn scan_until_found(expected_fullname: &str, expected_port: u16) {
+fn scan_until_found(expected_host_id: &str, expected_port: u16) {
     let deadline = Instant::now() + Duration::from_secs(15);
 
     while Instant::now() < deadline {
@@ -19,8 +19,7 @@ fn scan_until_found(expected_fullname: &str, expected_port: u16) {
         );
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let needle = format!("- {expected_fullname} at ");
-        let has_host = stdout.lines().any(|line| line.contains(&needle));
+        let has_host = stdout.lines().any(|line| line.contains(expected_host_id));
         let has_port = stdout
             .lines()
             .any(|line| line.contains(&format!(":{expected_port}")));
@@ -32,7 +31,7 @@ fn scan_until_found(expected_fullname: &str, expected_port: u16) {
         thread::sleep(Duration::from_millis(250));
     }
 
-    panic!("did not scan expected host `{expected_fullname}` on port {expected_port} in time");
+    panic!("did not scan expected host `{expected_host_id}` on port {expected_port} in time");
 }
 
 #[test]
@@ -72,12 +71,12 @@ fn init_serve_scan_and_get_status() {
 
     wait_for_tcp(("127.0.0.1", port), Duration::from_secs(10));
 
-    scan_until_found(&expected_fullname, port);
+    scan_until_found(&host_tag, port);
 
     let status_out = run_ok(
         {
             let mut cmd = Command::new(bin());
-            cmd.arg("debug").arg("status").arg(&expected_fullname);
+            cmd.arg("debug").arg("status").arg(&host_tag);
             cmd
         },
         "scup debug status",

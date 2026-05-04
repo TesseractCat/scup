@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn wait_for_scan_host(local_dir: &Path, expected_fullname: &str, timeout: Duration) {
+fn wait_for_scan_host(local_dir: &Path, expected_host_id: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {
@@ -24,14 +24,14 @@ fn wait_for_scan_host(local_dir: &Path, expected_fullname: &str, timeout: Durati
         );
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.lines().any(|line| line.contains(expected_fullname)) {
+        if stdout.lines().any(|line| line.contains(expected_host_id)) {
             return;
         }
 
         thread::sleep(Duration::from_millis(250));
     }
 
-    panic!("did not discover host `{expected_fullname}` in time");
+    panic!("did not discover host `{expected_host_id}` in time");
 }
 
 fn sha256_file(path: &Path) -> String {
@@ -97,7 +97,6 @@ fn clone_repo_from_host_by_root_name() {
 
     let port = free_port();
     let host_tag = format!("scup-test-clone-{}", std::process::id());
-    let expected_fullname = format!("scup-{host_tag}._scup._tcp.local.");
 
     let server = ChildGuard({
         let mut cmd = Command::new(bin());
@@ -112,14 +111,14 @@ fn clone_repo_from_host_by_root_name() {
     });
 
     wait_for_tcp(("127.0.0.1", port), Duration::from_secs(10));
-    wait_for_scan_host(&client, &expected_fullname, Duration::from_secs(20));
+    wait_for_scan_host(&client, &host_tag, Duration::from_secs(20));
 
     run_ok(
         {
             let mut cmd = Command::new(bin());
             cmd.current_dir(&client)
                 .arg("clone")
-                .arg(&expected_fullname)
+                .arg(&host_tag)
                 .arg("origin-repo");
             cmd
         },

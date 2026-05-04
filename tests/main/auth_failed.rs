@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn wait_for_scan_host(local_dir: &Path, expected_fullname: &str, timeout: Duration) {
+fn wait_for_scan_host(local_dir: &Path, expected_host_id: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {
@@ -22,14 +22,14 @@ fn wait_for_scan_host(local_dir: &Path, expected_fullname: &str, timeout: Durati
         );
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.lines().any(|line| line.contains(expected_fullname)) {
+        if stdout.lines().any(|line| line.contains(expected_host_id)) {
             return;
         }
 
         thread::sleep(Duration::from_millis(250));
     }
 
-    panic!("did not discover host `{expected_fullname}` in time");
+    panic!("did not discover host `{expected_host_id}` in time");
 }
 
 fn generate_key(path: &Path) {
@@ -91,7 +91,7 @@ fn authentication_fails_with_invalid_key() {
     });
 
     wait_for_tcp(("127.0.0.1", port), Duration::from_secs(10));
-    wait_for_scan_host(&client_dir, &expected_fullname, Duration::from_secs(20));
+    wait_for_scan_host(&client_dir, &host_tag, Duration::from_secs(20));
 
     let out = {
         let mut cmd = Command::new(bin());
