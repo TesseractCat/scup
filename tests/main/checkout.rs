@@ -17,7 +17,9 @@ fn checkout_moves_head_and_removes_files_not_in_target_snapshot() {
         "scup init",
     );
 
-    let repo_after_init = scup::Repository::load(&repo_dir);
+    let repo_after_init = scup::RepositorySession::load(&repo_dir)
+        .expect("failed to load repo after init")
+        .repository;
     let first_head = repo_after_init.head;
 
     fs::write(repo_dir.join("note.txt"), b"v2\n").expect("failed to update file");
@@ -34,7 +36,9 @@ fn checkout_moves_head_and_removes_files_not_in_target_snapshot() {
         "scup snapshot",
     );
 
-    let repo_after_second = scup::Repository::load(&repo_dir);
+    let repo_after_second = scup::RepositorySession::load(&repo_dir)
+        .expect("failed to load repo after second snapshot")
+        .repository;
     let second_head = repo_after_second.head;
     assert_ne!(
         first_head, second_head,
@@ -69,7 +73,9 @@ fn checkout_moves_head_and_removes_files_not_in_target_snapshot() {
         "checkout should remove files not present in target snapshot"
     );
 
-    let repo_after_checkout = scup::Repository::load(&repo_dir);
+    let repo_after_checkout = scup::RepositorySession::load(&repo_dir)
+        .expect("failed to load repo after checkout")
+        .repository;
     assert_eq!(
         repo_after_checkout.head, first_head,
         "checkout should move repository head to the checked-out snapshot"

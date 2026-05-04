@@ -51,6 +51,7 @@ pub fn cli() -> Command {
                 .arg(arg!(-m --message <MESSAGE> "Snapshot message").required(false)),
         )
         .subcommand(Command::new("push").about("Scan and push this repository to matching hosts"))
+        .subcommand(Command::new("status").about("Show local status and remote sync state"))
         .subcommand(
             Command::new("pull")
                 .about("Scan and pull this repository from matching hosts")

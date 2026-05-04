@@ -1,5 +1,5 @@
 use log::info;
-use std::path::{Path, PathBuf};
+use std::{io::Write, path::{Path, PathBuf}};
 
 mod cli;
 use cli::cli;
@@ -13,9 +13,13 @@ fn init_logger(verbosity: u8) {
         "info".to_string()
     };
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
-        .target(env_logger::Target::Stdout)
-        .init();
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level));
+    builder.target(env_logger::Target::Stdout);
+    if verbosity == 0 {
+        builder.format(|buf, record| writeln!(buf, "{}", record.args()));
+    }
+    builder.init();
 }
 
 fn main() -> anyhow::Result<()> {
@@ -60,6 +64,9 @@ fn main() -> anyhow::Result<()> {
                 .get_one::<u64>("timeout")
                 .expect("timeout has default in clap");
             scup::scan(timeout)?;
+        }
+        Some(("status", _)) => {
+            tokio::runtime::Runtime::new()?.block_on(scup::status(Path::new(".")))?;
         }
         Some(("push", _)) => {
             tokio::runtime::Runtime::new()?.block_on(scup::push_all(Path::new(".")))?;

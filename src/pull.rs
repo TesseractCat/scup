@@ -6,6 +6,7 @@ use std::{
 use crate::{
     Blob, List, Object, ObjectId, Repository, RepositoryId, RepositorySession, protocol, scan,
 };
+use std::fs::File;
 use kdam::{Bar, BarExt};
 use log::{debug, info};
 use relative_path::{Component as RelativeComponent, RelativePath};
@@ -463,6 +464,19 @@ fn checkout_snapshot_from_repo(
 
         let data = blob_bytes(session, *blob_id)?;
         std::fs::write(&full_path, data)?;
+
+        if let Some(Object::Blob(blob)) = session.repository.objects.get(blob_id) {
+            let mut times = std::fs::FileTimes::new();
+            if let Some(modified) = blob.modified_time {
+                times = times.set_modified(modified);
+            }
+            if let Some(accessed) = blob.accessed_time {
+                times = times.set_accessed(accessed);
+            }
+            let file = File::options().write(true).open(&full_path)?;
+            file.set_times(times)?;
+        }
+
     }
 
     Ok(())

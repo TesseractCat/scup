@@ -57,6 +57,13 @@ fn sha256_file(path: &Path) -> String {
         .collect()
 }
 
+fn modified_time(path: &Path) -> std::time::SystemTime {
+    fs::metadata(path)
+        .unwrap_or_else(|e| panic!("failed to stat {}: {e}", path.display()))
+        .modified()
+        .unwrap_or_else(|e| panic!("failed to read mtime {}: {e}", path.display()))
+}
+
 #[test]
 fn clone_repo_from_host_by_root_name() {
     let root = unique_temp_dir("scup-clone");
@@ -133,8 +140,12 @@ fn clone_repo_from_host_by_root_name() {
         "cloned random.bin missing"
     );
 
-    let src_repo = scup::Repository::load(&origin);
-    let cloned_repo = scup::Repository::load(&cloned_repo_dir);
+    let src_repo = scup::RepositorySession::load(&origin)
+        .expect("failed to load origin repository session")
+        .repository;
+    let cloned_repo = scup::RepositorySession::load(&cloned_repo_dir)
+        .expect("failed to load cloned repository session")
+        .repository;
 
     assert_eq!(cloned_repo.repo_uuid, src_repo.repo_uuid);
     assert_eq!(cloned_repo.head, src_repo.head);
@@ -154,6 +165,17 @@ fn clone_repo_from_host_by_root_name() {
     assert_eq!(
         sha256_file(&cloned_repo_dir.join("random.bin")),
         sha256_file(&origin.join("random.bin"))
+    );
+
+    assert_eq!(
+        modified_time(&cloned_repo_dir.join("hello.txt")),
+        modified_time(&origin.join("hello.txt")),
+        "hello.txt mtime differs after clone"
+    );
+    assert_eq!(
+        modified_time(&cloned_repo_dir.join("random.bin")),
+        modified_time(&origin.join("random.bin")),
+        "random.bin mtime differs after clone"
     );
 
     drop(server);
